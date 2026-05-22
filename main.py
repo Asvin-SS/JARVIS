@@ -47,6 +47,7 @@ from memory.memory_manager import load_memory, update_memory, format_memory_for_
 from llm_client import chat_with_tools, get_active_model, get_settings, warm_up_model, unified_chat
 from db.database import init_db, get_db, get_active_tasks, get_watchlist, add_session
 
+from actions.market_tracker    import run as market_tracker
 from actions.file_processor    import file_processor
 from actions.flight_finder     import flight_finder
 from actions.open_app          import open_app
@@ -97,6 +98,38 @@ def _load_system_prompt() -> str:
 
 # ── Tool declarations (same schema as before, passed to Ollama) ───────────────
 TOOL_DECLARATIONS = [
+    {
+        "name": "get_catchup",
+        "description": "Retrieves the summary of the last session and recent conversation turns for context.",
+        "parameters": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "save_task",
+        "description": "Saves a new task to the database for tracking.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Short title of the task"},
+                "description": {"type": "string", "description": "Detailed description"},
+                "category": {"type": "string", "description": "work | personal | reminder | etc"}
+            },
+            "required": ["title"]
+        }
+    },
+    {
+        "name": "market_tracker",
+        "description": "Tracks stocks, manages watchlist, and opens broker sites.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["add", "show_watchlist", "open_broker", "get_price"]},
+                "symbol": {"type": "string"},
+                "broker": {"type": "string"},
+                "label":  {"type": "string"}
+            },
+            "required": ["action"]
+        }
+    },
     {
         "name": "open_app",
         "description": (
@@ -660,6 +693,8 @@ def _transcribe(audio_np: np.ndarray) -> str:
 
 # ── Main assistant class ──────────────────────────────────────────────────────
 
+import queue
+
 class JarvisLocal:
 
     def __init__(self, ui: JarvisUI):
@@ -671,9 +706,66 @@ class JarvisLocal:
         self._wake_listener = _WakeWordListener(self._on_wake)
         self._last_interaction = time.time()
         self._idle_timer_running = False
+        
+        # Task 13: TTS Queue
+        self._tts_queue = queue.Queue()
+        self._tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
+        self._tts_thread.start()
 
         # wire up UI text command
         self.ui.on_text_command = self._on_text_command
+        self.ui.on_close = self._on_close
+        self.ui.on_mute_changed = self._on_mute_changed
+
+    def _tts_worker(self):
+        """Dedicated thread for speaking from a queue."""
+        while True:
+            text = self._tts_queue.get()
+            if self.ui.muted:
+                self._tts_queue.task_done()
+                continue
+                
+            self.ui.set_state("SPEAKING")
+            self._recorder.set_jarvis_speaking(True)
+            try:
+                _tts.speak(text)
+            except Exception as e:
+                print(f"[JARVIS] Primary TTS failed, using fallback: {e}")
+                try:
+                    import pyttsx3
+                    engine = pyttsx3.init()
+                    engine.say(text)
+                    engine.runAndWait()
+                except Exception as e2:
+                    print(f"[JARVIS] Fallback TTS also failed: {e2}")
+            
+            self._recorder.set_jarvis_speaking(False)
+            self.ui.set_state("LISTENING")
+            self._tts_queue.task_done()
+
+    def _on_mute_changed(self, muted: bool):
+        """Saves mute preference to DB."""
+        try:
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute("REPLACE INTO preferences (key, value) VALUES ('muted', ?)", (str(muted),))
+            conn.commit()
+            conn.close()
+        except Exception: pass
+
+    def _on_close(self):
+        """Task 12.4: Save session summary on close."""
+        from memory.memory_manager import generate_session_summary
+        summary = generate_session_summary(self._history)
+        try:
+            conn = get_db()
+            cursor = conn.cursor()
+            now = datetime.now().isoformat()
+            # Find the active session and close it
+            cursor.execute("UPDATE sessions SET ended_at = ?, summary = ? WHERE ended_at IS NULL", (now, summary))
+            conn.commit()
+            conn.close()
+        except Exception: pass
 
     # ── public start ─────────────────────────────────────────────────
     def start(self):
@@ -708,13 +800,14 @@ class JarvisLocal:
         # Get weather
         weather_info = "Weather data unavailable."
         try:
-            weather_info = weather_action({"city": "current location"}, player=self.ui)
+            from actions.weather_report import weather_action
+            weather_info = weather_action({"city": "current location"})
         except Exception:
             pass
             
         # Get tasks
         tasks = get_active_tasks()
-        task_info = f"You have {len(tasks)} active tasks." if tasks else "You have no active tasks."
+        task_info = f"You have {len(tasks)} pending tasks from last session." if tasks else "You have no active tasks."
         if tasks:
             task_info += f" Most recent: \"{tasks[0]['title']}\"."
             
@@ -737,6 +830,7 @@ class JarvisLocal:
         - Watchlist: {watchlist_info}
         - Model: {model_name}
         
+        After the greeting, if there are pending tasks, ask: "Want me to recap your pending tasks?"
         Return only the text to be spoken. Be brief and efficient.
         """
         
@@ -751,10 +845,10 @@ class JarvisLocal:
         # Store session
         add_session(now.isoformat(), summary="Started session")
         
-        # After greeting, display incomplete tasks in side panel
-        if tasks:
-            task_list_str = "\n".join([f"• {t['title']}" for t in tasks[:5]])
-            self.ui.write_log(f"SYS: Active Tasks:\n{task_list_str}")
+        # Update UI side panel (direct call or signal)
+        # This will be handled by the UI refresh timer but we can force it
+        if hasattr(self.ui._win, "_refresh_side"):
+            self.ui._win._refresh_side()
 
     def _on_wake(self):
         """Called when wake word is detected."""
@@ -955,27 +1049,8 @@ class JarvisLocal:
 
     # ── TTS output ────────────────────────────────────────────────────
     def _speak(self, text: str):
-        # BUG 3 Fix: Unconditional TTS
-        def _run():
-            self.ui.set_state("SPEAKING")
-            self._recorder.set_jarvis_speaking(True)
-            try:
-                _tts.speak(text)
-            except Exception as e:
-                print(f"[JARVIS] Primary TTS failed, using fallback: {e}")
-                # Fallback to direct pyttsx3 call if _tts singleton failed
-                try:
-                    import pyttsx3
-                    engine = pyttsx3.init()
-                    engine.say(text)
-                    engine.runAndWait()
-                except Exception as e2:
-                    print(f"[JARVIS] Fallback TTS also failed: {e2}")
-            
-            self._recorder.set_jarvis_speaking(False)
-            if not self.ui.muted:
-                self.ui.set_state("LISTENING")
-        threading.Thread(target=_run, daemon=True).start()
+        # Task 13: Unconditional TTS with queue
+        self._tts_queue.put(text)
 
     # ── system prompt ─────────────────────────────────────────────────
     def _build_system_prompt(self) -> str:
@@ -996,7 +1071,29 @@ class JarvisLocal:
         ui = self.ui
 
         try:
-            if name == "save_memory":
+            if name == "get_catchup":
+                from memory.memory_manager import get_session_catchup
+                return get_session_catchup()
+
+            if name == "save_task":
+                title = args.get("title")
+                desc = args.get("description", "")
+                cat = args.get("category", "personal")
+                try:
+                    conn = get_db()
+                    cursor = conn.cursor()
+                    now = datetime.now().isoformat()
+                    cursor.execute(
+                        "INSERT INTO tasks (created_at, updated_at, title, description, category) VALUES (?, ?, ?, ?, ?)",
+                        (now, now, title, desc, cat)
+                    )
+                    conn.commit()
+                    conn.close()
+                    return f"Task '{title}' saved successfully."
+                except Exception as e:
+                    return f"Failed to save task: {e}"
+
+            elif name == "save_memory":
                 category = args.get("category", "notes")
                 key      = args.get("key", "")
                 value    = args.get("value", "")
@@ -1004,6 +1101,9 @@ class JarvisLocal:
                     update_memory({category: {key: {"value": value}}})
                     print(f"[Memory] 💾 {category}/{key} = {value}")
                 return "ok"
+
+            elif name == "market_tracker":
+                return market_tracker(parameters=args, player=ui) or "Market data retrieved."
 
             elif name == "open_app":
                 return open_app(parameters=args, response=None, player=ui) or f"Opened {args.get('app_name')}."

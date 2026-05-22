@@ -27,6 +27,7 @@ PyPDF2
 python-docx
 pandas
 openpyxl
+yfinance
 pvporcupine
 SpeechRecognition
 pyaudio

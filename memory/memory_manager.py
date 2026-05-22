@@ -212,4 +212,47 @@ def forget(key: str, category: str = "notes") -> str:
     return f"Not found: {category}/{key}"
 
 
+def get_session_catchup() -> str:
+    """Fetches last session summary and recent conversation for catch-up."""
+    try:
+        from db.database import get_db
+        conn = get_db()
+        cursor = conn.cursor()
+        
+        # Last session summary
+        cursor.execute("SELECT summary, ended_at FROM sessions WHERE summary IS NOT NULL ORDER BY ended_at DESC LIMIT 1")
+        last_session = cursor.fetchone()
+        
+        # Last 10 turns
+        cursor.execute("SELECT role, content FROM conversations ORDER BY timestamp DESC LIMIT 10")
+        recent = cursor.fetchall()
+        conn.close()
+        
+        lines = []
+        if last_session:
+            lines.append(f"Last session ({last_session[1]}): {last_session[0]}")
+        
+        if recent:
+            lines.append("\nRecent conversation history:")
+            for r in reversed(recent):
+                lines.append(f"  {r[0].title()}: {r[1][:100]}...")
+        
+        return "\n".join(lines) if lines else "No previous session data found."
+    except Exception as e:
+        return f"Error retrieving catch-up data: {e}"
+
+def generate_session_summary(history: list[dict]) -> str:
+    """Uses LLM to generate a one-line summary of the session."""
+    if not history:
+        return "No activity recorded."
+    
+    try:
+        from llm_client import unified_chat
+        context = "\n".join([f"{h['role']}: {h['content'][:100]}" for h in history[-10:]])
+        prompt = f"Summarize this session in one brief sentence for Jarvis to remember:\n\n{context}"
+        summary = unified_chat("You are JARVIS.", prompt)
+        return summary.strip()
+    except Exception:
+        return "Session ended."
+
 forget_memory = forget
