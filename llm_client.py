@@ -228,27 +228,38 @@ def get_ollama_model_catalog() -> dict[str, list[dict[str, Any]]]:
 
     return {"installed": installed, "recommended": recommended}
 
-def _ollama_chat(model: str, messages: list[dict], tools: list[dict] | None = None, timeout: int = 120) -> dict:
+def _ollama_chat(model: str, messages: list[dict], tools: list[dict] | None = None, timeout: int = None, stream: bool = False) -> Any:
     """
     Calls Ollama's /api/chat endpoint.
-    Returns the full response dict so callers can inspect tool_calls or message content.
+    Supports streaming if stream=True.
     """
+    if timeout is None:
+        timeout = int(os.environ.get("OLLAMA_TIMEOUT_SEC", 600))
+
     body: dict = {
         "model": model,
         "messages": messages,
-        "stream": False,
+        "stream": stream,
     }
     if tools:
         body["tools"] = tools
 
     try:
-        r = _requests.post(
-            "http://localhost:11434/api/chat",
-            json=body,
-            timeout=timeout,
-        )
-        r.raise_for_status()
-        return r.json()
+        if stream:
+            return _requests.post(
+                "http://localhost:11434/api/chat",
+                json=body,
+                timeout=timeout,
+                stream=True
+            )
+        else:
+            r = _requests.post(
+                "http://localhost:11434/api/chat",
+                json=body,
+                timeout=timeout,
+            )
+            r.raise_for_status()
+            return r.json()
     except _requests.exceptions.ConnectionError:
         raise RuntimeError("Ollama is not running. Start it with: ollama serve")
     except _requests.exceptions.Timeout:
@@ -261,46 +272,95 @@ def _run_ollama_prompt(model: str, prompt: str, timeout: int = 60) -> str:
     return resp.get("message", {}).get("content", "").strip()
 
 
+def get_relevant_tools(user_text: str, all_tools: list[dict]) -> list[dict]:
+    """
+    Simple keyword-based intent classifier to reduce the tool list sent to LLM.
+    """
+    text = user_text.lower()
+    
+    # Mapping keywords to tool names
+    mapping = {
+        "weather": ["weather_report"],
+        "open": ["open_app", "browser_control"],
+        "launch": ["open_app", "browser_control"],
+        "search": ["web_search", "browser_control"],
+        "find": ["web_search", "file_controller", "flight_finder"],
+        "file": ["file_controller", "file_processor"],
+        "folder": ["file_controller"],
+        "message": ["send_message"],
+        "whatsapp": ["send_message"],
+        "telegram": ["send_message"],
+        "remind": ["reminder"],
+        "video": ["youtube_video"],
+        "youtube": ["youtube_video"],
+        "screen": ["screen_process", "computer_control"],
+        "camera": ["screen_process"],
+        "volume": ["computer_settings"],
+        "brightness": ["computer_settings"],
+        "code": ["code_helper", "dev_agent"],
+        "write": ["code_helper", "file_controller"],
+        "build": ["dev_agent"],
+        "task": ["agent_task"],
+        "stock": ["web_search"],
+        "market": ["web_search"],
+        "flight": ["flight_finder"],
+        "game": ["game_updater"],
+        "steam": ["game_updater"],
+        "epic": ["game_updater"],
+        "shutdown": ["shutdown_jarvis"],
+        "stop": ["shutdown_jarvis"],
+        "bye": ["shutdown_jarvis"],
+        "remember": ["save_memory"],
+    }
+
+    relevant_names = set()
+    for kw, tool_names in mapping.items():
+        if kw in text:
+            relevant_names.update(tool_names)
+    
+    # If no keywords match, send a core set or all if preferred.
+    # Here we send a broader set if no specific intent is found.
+    if not relevant_names:
+        return all_tools
+    
+    # Filter tools based on detected names
+    return [t for t in all_tools if t["name"] in relevant_names or t["name"] == "save_memory"]
+
+
 def chat_with_tools(
     messages: list[dict],
     tools: list[dict],
     system_prompt: str = "",
     provider: str | None = None,
     model: str | None = None,
-    timeout: int = 120,
-) -> dict:
+    timeout: int = None,
+    stream: bool = False,
+) -> Any:
     """
     Main entry point for JarvisLocal.
     Sends a full conversation + tool definitions to the active model.
-    Returns Ollama's raw response dict:
-      {
-        "message": {
-          "role": "assistant",
-          "content": "...",           # text reply (may be empty if tool called)
-          "tool_calls": [             # present only when model wants to call a tool
-            {
-              "function": {
-                "name": "open_app",
-                "arguments": {"app_name": "Chrome"}
-              }
-            }
-          ]
-        }
-      }
     """
+    # BUG 2 Fix: Freshly read active model on every call
     selection = get_active_model() if (provider is None or model is None) else {"provider": provider, "model": model}
     active_provider = selection["provider"]
     active_model    = selection["model"]
+
+    if timeout is None:
+        timeout = int(os.environ.get("OLLAMA_TIMEOUT_SEC", 600))
 
     full_messages = []
     if system_prompt:
         full_messages.append({"role": "system", "content": system_prompt})
     full_messages.extend(messages)
 
-    if active_provider == "ollama":
-        return _ollama_chat(active_model, full_messages, tools=tools, timeout=timeout)
+    # BUG 1 Fix: Filter tools based on user intent
+    last_user_msg = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+    relevant_tools = get_relevant_tools(last_user_msg, tools) if last_user_msg else tools
 
-    # OpenAI-compatible fallback (tool calling works the same way)
+    if active_provider == "ollama":
+        return _ollama_chat(active_model, full_messages, tools=relevant_tools, timeout=timeout, stream=stream)
+
+    # OpenAI-compatible fallback
     if active_provider == "openai":
         key = get_openai_api_key()
         if not key:
@@ -308,21 +368,39 @@ def chat_with_tools(
         body = {
             "model": active_model,
             "messages": full_messages,
-            "tools": [{"type": "function", "function": t} for t in tools],
+            "tools": [{"type": "function", "function": t} for t in relevant_tools],
             "tool_choice": "auto",
+            "stream": stream
         }
         r = _requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             json=body, timeout=timeout,
+            stream=stream
         )
         r.raise_for_status()
+        if stream:
+            return r
         data = r.json()
-        # Normalise to Ollama shape so callers don't need to branch
         choice = data["choices"][0]["message"]
         return {"message": choice}
 
     raise RuntimeError(f"Provider '{active_provider}' not supported for tool chat.")
+
+
+def warm_up_model():
+    """
+    Sends a small prompt to Ollama to load the model into memory.
+    """
+    selection = get_active_model()
+    if selection["provider"] == "ollama":
+        model = selection["model"]
+        print(f"[JARVIS] Warming up {model}...")
+        try:
+            _ollama_chat(model, [{"role": "user", "content": "hi"}], stream=False, timeout=30)
+            print(f"[JARVIS] Model {model} ready")
+        except Exception as e:
+            print(f"[JARVIS] Warm-up failed: {e}")
 
 
 def is_ollama_running() -> bool:

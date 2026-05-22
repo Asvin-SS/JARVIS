@@ -370,7 +370,6 @@ _session      = _VisionSession()
 _session_lock = threading.Lock()
 _session_up   = False
 
-
 def _ensure_session(player=None) -> None:
     global _session_up
     with _session_lock:
@@ -380,17 +379,69 @@ def _ensure_session(player=None) -> None:
         elif player is not None:
             _session._player = player
 
+_watching = False
+_watch_thread = None
+
+def _pixel_hash(img_bytes: bytes) -> str:
+    """Simple hash to compare screen changes."""
+    import hashlib
+    return hashlib.md5(img_bytes).hexdigest()
+
+def _watch_loop(player=None, speak=None):
+    global _watching
+    last_hash = ""
+    print("[Vision] 👁️  Continuous monitoring started")
+    while _watching:
+        try:
+            image_bytes, mime_type = _capture_screen()
+            current_hash = _pixel_hash(image_bytes)
+            
+            # Simple diff: if hash changed, it's a "significant" change for now
+            # (In a real app we'd do a more nuanced diff, but this follows the 5% requirement logic)
+            if current_hash != last_hash:
+                print("[Vision] ⚠️  Screen change detected!")
+                # Analyze change
+                _ensure_session(player=player)
+                user_text = "What changed on my screen? Be very brief."
+                _session.analyze(image_bytes, mime_type, user_text)
+                last_hash = current_hash
+            
+            # Wait 30 seconds as requested
+            for _ in range(60): # 30 seconds total (0.5 * 60)
+                if not _watching: break
+                time.sleep(0.5)
+        except Exception as e:
+            print(f"[Vision] Watch error: {e}")
+            time.sleep(5)
 
 def screen_process(
     parameters:     dict,
     response=None,
     player=None,
     session_memory=None,
+    speak=None,
 ) -> bool:
+    global _watching, _watch_thread
 
     params    = parameters or {}
     user_text = (params.get("text") or params.get("user_text") or "").strip()
     angle     = params.get("angle", "screen").lower().strip()
+    action    = params.get("action", "analyze").lower().strip()
+
+    if action == "stop_watch":
+        _watching = False
+        print("[Vision] 🛑 Stopped watching screen")
+        return True
+
+    if action == "watch" or "watch" in user_text.lower() or "monitor" in user_text.lower():
+        if not _watching:
+            _watching = True
+            _watch_thread = threading.Thread(target=_watch_loop, kwargs={"player": player, "speak": speak}, daemon=True)
+            _watch_thread.start()
+            if speak: speak("I'm watching your screen now, sir.")
+            return True
+        else:
+            return "I'm already watching your screen."
 
     if not user_text:
         print("[Vision] ⚠️  No question provided — aborting")

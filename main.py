@@ -11,6 +11,7 @@ import re
 import sys
 import threading
 import traceback
+import importlib
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,14 @@ from typing import Any
 import numpy as np
 import sounddevice as sd
 
-# ── optional imports — degrade gracefully if not installed ────────────────────
+try:
+    import speech_recognition as sr
+    _SR_OK = True
+except ImportError:
+    _SR_OK = False
+    print("[JARVIS] speech_recognition not installed — wake word disabled. pip install SpeechRecognition pyaudio")
+
+import winsound # For beep/chime
 try:
     from faster_whisper import WhisperModel as _WhisperModel
     _WHISPER_OK = True
@@ -36,7 +44,8 @@ except ImportError:
 # ── project imports ───────────────────────────────────────────────────────────
 from ui import JarvisUI
 from memory.memory_manager import load_memory, update_memory, format_memory_for_prompt
-from llm_client import chat_with_tools, get_active_model, get_settings
+from llm_client import chat_with_tools, get_active_model, get_settings, warm_up_model, unified_chat
+from db.database import init_db, get_db, get_active_tasks, get_watchlist, add_session
 
 from actions.file_processor    import file_processor
 from actions.flight_finder     import flight_finder
@@ -582,6 +591,39 @@ class _VoiceRecorder:
             print(f"[JARVIS] Mic error: {e}")
 
 
+class _WakeWordListener:
+    """Listens for 'Jarvis' or 'Wake up Jarvis' in the background."""
+    def __init__(self, on_wake):
+        self.on_wake = on_wake
+        self._running = False
+        self._thread = None
+        self._recognizer = sr.Recognizer() if _SR_OK else None
+
+    def start(self):
+        if not _SR_OK: return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+
+    def _loop(self):
+        with sr.Microphone() as source:
+            self._recognizer.adjust_for_ambient_noise(source)
+            while self._running:
+                try:
+                    # Listen for a short burst
+                    audio = self._recognizer.listen(source, timeout=5, phrase_time_limit=3)
+                    text = self._recognizer.recognize_google(audio).lower()
+                    if any(w in text for w in ["jarvis", "wake up", "hey jarvis"]):
+                        self.on_wake()
+                except (sr.WaitTimeoutError, sr.UnknownValueError, sr.RequestError):
+                    continue
+                except Exception as e:
+                    print(f"[WakeWord] Error: {e}")
+                    time.sleep(1)
+
 # ── Whisper STT ───────────────────────────────────────────────────────────────
 
 _whisper_model = None
@@ -625,25 +667,143 @@ class JarvisLocal:
         self._history: list[dict] = []   # conversation history for Ollama
         self._lock         = threading.Lock()
         self._recorder     = _VoiceRecorder(self._on_raw_audio)
+        self.interrupt_event = threading.Event()
+        self._wake_listener = _WakeWordListener(self._on_wake)
+        self._last_interaction = time.time()
+        self._idle_timer_running = False
 
         # wire up UI text command
         self.ui.on_text_command = self._on_text_command
 
     # ── public start ─────────────────────────────────────────────────
     def start(self):
+        # BUG 1 Fix: Warm up model on startup
+        warm_up_model()
+        
         model_info = get_active_model()
         self.ui.write_log(
             f"SYS: JARVIS online — {model_info['provider']} / {model_info['model']}"
         )
         self.ui.set_state("LISTENING")
         self._recorder.start()
+        self._wake_listener.start()
+        self._start_idle_timer()
+        
         print(f"[JARVIS] ✅ Started. Model: {model_info}")
+        
+        # TASK 3: Startup greeting
+        threading.Thread(target=self._run_greeting, daemon=True).start()
+        
+        # Start minimized to tray as requested in TASK 2
+        self.ui._win.hide_to_tray()
+
+    def _run_greeting(self):
+        """Generates and speaks the startup greeting."""
+        now = datetime.now()
+        hour = now.hour
+        if hour < 12: greeting_base = "Good morning, SS."
+        elif hour < 17: greeting_base = "Good afternoon, SS."
+        else: greeting_base = "Good evening, SS."
+        
+        # Get weather
+        weather_info = "Weather data unavailable."
+        try:
+            weather_info = weather_action({"city": "current location"}, player=self.ui)
+        except Exception:
+            pass
+            
+        # Get tasks
+        tasks = get_active_tasks()
+        task_info = f"You have {len(tasks)} active tasks." if tasks else "You have no active tasks."
+        if tasks:
+            task_info += f" Most recent: \"{tasks[0]['title']}\"."
+            
+        # Get watchlist
+        watchlist = get_watchlist()
+        watchlist_info = f"Your watchlist has {len(watchlist)} stocks." if watchlist else ""
+        
+        # Model info
+        model_info = get_active_model()
+        model_name = model_info['model']
+        
+        # Build prompt for LLM to format the greeting
+        prompt = f"""
+        Create a concise, professional Jarvis-style greeting based on this context:
+        - Base: {greeting_base}
+        - Time: {now.strftime("%I:%M %p")}
+        - Date: {now.strftime("%A, %B %d")}
+        - Weather: {weather_info}
+        - Tasks: {task_info}
+        - Watchlist: {watchlist_info}
+        - Model: {model_name}
+        
+        Return only the text to be spoken. Be brief and efficient.
+        """
+        
+        try:
+            formatted_greeting = unified_chat("You are JARVIS.", prompt)
+        except Exception:
+            formatted_greeting = f"{greeting_base} It is {now.strftime('%I:%M %p')}. {weather_info} {task_info} I'm running on {model_name}. Ready when you are."
+
+        self.ui.write_log(f"Jarvis: {formatted_greeting}")
+        self._speak(formatted_greeting)
+        
+        # Store session
+        add_session(now.isoformat(), summary="Started session")
+        
+        # After greeting, display incomplete tasks in side panel
+        if tasks:
+            task_list_str = "\n".join([f"• {t['title']}" for t in tasks[:5]])
+            self.ui.write_log(f"SYS: Active Tasks:\n{task_list_str}")
+
+    def _on_wake(self):
+        """Called when wake word is detected."""
+        print("[JARVIS] 🔔 Wake word detected!")
+        self._last_interaction = time.time()
+        
+        # 1. Restore window
+        self.ui._win.show_window()
+        
+        # 2. Play chime
+        try:
+            winsound.Beep(1000, 200)
+            winsound.Beep(1200, 200)
+        except Exception:
+            pass
+            
+        # 3. Say "I'm listening"
+        self._speak("I'm listening, sir.")
+        
+        # 4. Flash mic indicator (already handled by set_state LISTENING which is called in _speak)
+        self.ui.set_state("LISTENING")
+
+    def _start_idle_timer(self):
+        if self._idle_timer_running: return
+        self._idle_timer_running = True
+        def _timer():
+            while True:
+                time.sleep(5)
+                if time.time() - self._last_interaction > 60:
+                    if self.ui._win.isVisible() and self.ui.state == "LISTENING":
+                        print("[JARVIS] 💤 Idle for 60s, minimizing...")
+                        self.ui._win.hide_to_tray()
+        threading.Thread(target=_timer, daemon=True).start()
 
     # ── voice path ───────────────────────────────────────────────────
     def _on_raw_audio(self, audio_np: np.ndarray):
         """Called from recorder thread when an utterance is captured."""
         if self.ui.muted:
             return
+        
+        self._last_interaction = time.time()
+        
+        # TASK 4 Fix: Handle interruption
+        if self.ui.state in ("THINKING", "SPEAKING", "PROCESSING"):
+            print("[JARVIS] ✋ Interrupted by voice!")
+            self.interrupt_event.set()
+            _tts.stop()
+            self.ui.write_log("Jarvis: [cancelled]")
+        
         self.ui.set_state("THINKING")
         text = _transcribe(audio_np)
         if not text or len(text.strip()) < 2:
@@ -654,12 +814,21 @@ class JarvisLocal:
 
     # ── text path (from input box) ────────────────────────────────────
     def _on_text_command(self, text: str):
+        self._last_interaction = time.time()
+        # TASK 4 Fix: Handle interruption
+        if self.ui.state in ("THINKING", "SPEAKING", "PROCESSING"):
+            print("[JARVIS] ✋ Interrupted by text!")
+            self.interrupt_event.set()
+            _tts.stop()
+            self.ui.write_log("Jarvis: [cancelled]")
+            
         self.ui.set_state("THINKING")
-        self._process(text)
+        threading.Thread(target=self._process, args=(text,), daemon=True).start()
 
     # ── core processing ───────────────────────────────────────────────
     def _process(self, user_text: str):
         """Send user_text to Ollama, handle tool calls, speak reply."""
+        self.interrupt_event.clear()
         try:
             system_prompt = self._build_system_prompt()
 
@@ -668,20 +837,53 @@ class JarvisLocal:
                 messages = list(self._history)
 
             self.ui.set_state("THINKING")
+            
+            # BUG 1 Fix: Use streaming
             resp = chat_with_tools(
                 messages=messages,
                 tools=TOOL_DECLARATIONS,
                 system_prompt=system_prompt,
+                stream=True
             )
 
-            msg = resp.get("message", {})
-            tool_calls = msg.get("tool_calls", [])
-            reply_text = msg.get("content", "") or ""
+            full_content = ""
+            tool_calls = []
+            
+            self.ui.write_log_no_type("Jarvis: ") # Start the AI log entry
+            
+            if hasattr(resp, "iter_lines"): # Streaming response
+                for line in resp.iter_lines():
+                    if self.interrupt_event.is_set():
+                        print("[JARVIS] ✋ Stream interrupted!")
+                        return
+                    
+                    if not line: continue
+                    chunk = json.loads(line.decode("utf-8"))
+                    
+                    if "message" in chunk:
+                        delta = chunk["message"].get("content", "")
+                        if delta:
+                            full_content += delta
+                            self.ui.stream_chunk(delta)
+                        
+                        if "tool_calls" in chunk["message"]:
+                            tool_calls.extend(chunk["message"]["tool_calls"])
+                    
+                    if chunk.get("done"):
+                        break
+            else: # Non-streaming fallback
+                msg = resp.get("message", {})
+                full_content = msg.get("content", "") or ""
+                tool_calls = msg.get("tool_calls", [])
+                if full_content:
+                    self.ui.stream_chunk(full_content)
 
             if tool_calls:
                 # execute each tool call sequentially
                 tool_results = []
                 for tc in tool_calls:
+                    if self.interrupt_event.is_set(): break
+                    
                     fn   = tc.get("function", {})
                     name = fn.get("name", "")
                     args = fn.get("arguments", {})
@@ -699,28 +901,48 @@ class JarvisLocal:
                         "name": name,
                     })
 
-                # send tool results back so Ollama can formulate a reply
-                with self._lock:
-                    self._history.append({"role": "assistant", "content": "", "tool_calls": tool_calls})
-                    self._history.extend(tool_results)
-                    messages2 = list(self._history)
+                if not self.interrupt_event.is_set():
+                    # send tool results back so Ollama can formulate a reply
+                    with self._lock:
+                        self._history.append({"role": "assistant", "content": full_content, "tool_calls": tool_calls})
+                        self._history.extend(tool_results)
+                        messages2 = list(self._history)
 
-                resp2     = chat_with_tools(
-                    messages=messages2,
-                    tools=TOOL_DECLARATIONS,
-                    system_prompt=system_prompt,
-                )
-                reply_text = resp2.get("message", {}).get("content", "") or ""
+                    resp2 = chat_with_tools(
+                        messages=messages2,
+                        tools=TOOL_DECLARATIONS,
+                        system_prompt=system_prompt,
+                        stream=True
+                    )
+                    
+                    final_reply = ""
+                    if hasattr(resp2, "iter_lines"):
+                        for line in resp2.iter_lines():
+                            if self.interrupt_event.is_set(): break
+                            if not line: continue
+                            chunk = json.loads(line.decode("utf-8"))
+                            delta = chunk.get("message", {}).get("content", "")
+                            if delta:
+                                final_reply += delta
+                                self.ui.stream_chunk(delta)
+                            if chunk.get("done"): break
+                    else:
+                        final_reply = resp2.get("message", {}).get("content", "") or ""
+                        if final_reply:
+                            self.ui.stream_chunk(final_reply)
+                    
+                    full_content = final_reply
 
             # trim history to last 20 turns to keep context manageable
             with self._lock:
-                self._history.append({"role": "assistant", "content": reply_text})
+                self._history.append({"role": "assistant", "content": full_content})
                 if len(self._history) > 40:
                     self._history = self._history[-40:]
 
-            if reply_text:
-                self.ui.write_log(f"Jarvis: {reply_text}")
-                self._speak(reply_text)
+            if full_content and not self.interrupt_event.is_set():
+                # End with a newline in log
+                self.ui.stream_chunk("\n")
+                self._speak(full_content)
             else:
                 self.ui.set_state("LISTENING")
 
@@ -733,11 +955,23 @@ class JarvisLocal:
 
     # ── TTS output ────────────────────────────────────────────────────
     def _speak(self, text: str):
+        # BUG 3 Fix: Unconditional TTS
         def _run():
             self.ui.set_state("SPEAKING")
             self._recorder.set_jarvis_speaking(True)
-            _tts.speak(text)
-            # pyttsx3 runAndWait blocks until done, so after this it's finished
+            try:
+                _tts.speak(text)
+            except Exception as e:
+                print(f"[JARVIS] Primary TTS failed, using fallback: {e}")
+                # Fallback to direct pyttsx3 call if _tts singleton failed
+                try:
+                    import pyttsx3
+                    engine = pyttsx3.init()
+                    engine.say(text)
+                    engine.runAndWait()
+                except Exception as e2:
+                    print(f"[JARVIS] Fallback TTS also failed: {e2}")
+            
             self._recorder.set_jarvis_speaking(False)
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
@@ -793,12 +1027,7 @@ class JarvisLocal:
                 return youtube_video(parameters=args, response=None, player=ui) or "Done."
 
             elif name == "screen_process":
-                threading.Thread(
-                    target=screen_process,
-                    kwargs={"parameters": args, "response": None, "player": ui, "session_memory": None},
-                    daemon=True,
-                ).start()
-                return "Vision module activated."
+                return screen_process(parameters=args, player=ui, speak=self._speak) or "Analysis complete."
 
             elif name == "computer_settings":
                 return computer_settings(parameters=args, response=None, player=ui) or "Done."
@@ -810,7 +1039,48 @@ class JarvisLocal:
                 return code_helper(parameters=args, player=ui, speak=self._speak) or "Done."
 
             elif name == "dev_agent":
-                return dev_agent(parameters=args, player=ui, speak=self._speak) or "Done."
+                description = args.get("description", "")
+                if any(x in description.lower() for x in ["tool", "feature", "capability"]):
+                    # Self-building mode
+                    from actions.dev_agent import build_jarvis_tool
+                    tool_info = build_jarvis_tool(description, speak=self._speak, player=ui)
+                    if tool_info:
+                        # Dynamically register the new tool
+                        try:
+                            module_name = f"actions.{tool_info['name']}"
+                            # Clear from cache if exists
+                            if module_name in sys.modules:
+                                del sys.modules[module_name]
+                            
+                            module = importlib.import_module(module_name)
+                            if hasattr(module, "TOOL_SPEC") and hasattr(module, "run"):
+                                # Add to global declarations
+                                TOOL_DECLARATIONS.append(module.TOOL_SPEC)
+                                # Confirmation
+                                msg = f"Done. I've created {tool_info['name']} and it's ready to use right now."
+                                ui.write_log(f"SYS: Registered new tool: {tool_info['name']}")
+                                self._speak(msg)
+                                
+                                # Store as task in DB
+                                try:
+                                    conn = get_db()
+                                    cursor = conn.cursor()
+                                    now = datetime.now().isoformat()
+                                    cursor.execute(
+                                        "INSERT INTO tasks (created_at, updated_at, title, description, category) VALUES (?, ?, ?, ?, ?)",
+                                        (now, now, f"Built tool: {tool_info['name']}", description, "self_built_tool")
+                                    )
+                                    conn.commit()
+                                    conn.close()
+                                except Exception as dbe:
+                                    print(f"[DB] Error saving tool task: {dbe}")
+                                
+                                return msg
+                        except Exception as e:
+                            return f"Tool built but registration failed: {e}"
+                    return "Tool building failed."
+                else:
+                    return dev_agent(parameters=args, player=ui, speak=self._speak) or "Done."
 
             elif name == "agent_task":
                 from agent.task_queue import get_queue, TaskPriority
@@ -862,6 +1132,9 @@ class JarvisLocal:
 
 def main():
     import time
+
+    # Initialize database
+    init_db()
 
     ui = JarvisUI("face.png")
 

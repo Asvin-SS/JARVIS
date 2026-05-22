@@ -20,12 +20,12 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QBrush, QColor, QDragEnterEvent, QDropEvent, QFont, QFontDatabase,
     QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
-    QRadialGradient, QShortcut,
+    QRadialGradient, QShortcut, QIcon, QAction,
 )
 from PyQt6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QPushButton, QScrollArea, QSizePolicy, QTextEdit,
-    QVBoxLayout, QWidget, QProgressBar,
+    QVBoxLayout, QWidget, QProgressBar, QSystemTrayIcon, QMenu,
 )
 
 def _base_dir() -> Path:
@@ -563,6 +563,33 @@ class LogWidget(QTextEdit):
     def append_log(self, text: str):
         self._sig.emit(text)
 
+    def append_log_no_type(self, text: str):
+        """Appends text immediately without the typing effect."""
+        cur = self.textCursor()
+        cur.movePosition(cur.MoveOperation.End)
+        fmt = cur.charFormat()
+        tl = text.lower()
+        if   tl.startswith("you:"):    col = qcol(C.WHITE)
+        elif tl.startswith("jarvis:"): col = qcol(C.PRI)
+        elif tl.startswith("file:"):   col = qcol(C.GREEN)
+        elif "err" in tl:              col = qcol(C.RED)
+        else:                          col = qcol(C.ACC2)
+        fmt.setForeground(QBrush(col))
+        cur.insertText(text, fmt)
+        self.setTextCursor(cur)
+        self.ensureCursorVisible()
+
+    def stream_chunk(self, chunk: str):
+        """Appends a small chunk of text immediately without queuing/typing."""
+        cur = self.textCursor()
+        cur.movePosition(cur.MoveOperation.End)
+        fmt = cur.charFormat()
+        # If we are streaming, we assume it's the AI response
+        fmt.setForeground(QBrush(qcol(C.PRI)))
+        cur.insertText(chunk, fmt)
+        self.setTextCursor(cur)
+        self.ensureCursorVisible()
+
     def _enqueue(self, text: str):
         self._queue.append(text)
         if not self._typing:
@@ -989,6 +1016,8 @@ class SetupOverlay(QWidget):
 
 class MainWindow(QMainWindow):
     _log_sig   = pyqtSignal(str)
+    _log_no_type_sig = pyqtSignal(str)
+    _stream_sig = pyqtSignal(str)
     _state_sig = pyqtSignal(str)
 
     def __init__(self, face_path: str):
@@ -996,6 +1025,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("J.A.R.V.I.S — MARK XXXIX")
         self.setMinimumSize(_MIN_W, _MIN_H)
         self.resize(_DEFAULT_W, _DEFAULT_H)
+        
+        self._setup_tray()
 
         screen = QApplication.primaryScreen().availableGeometry()
         self.move(
@@ -1044,6 +1075,8 @@ class MainWindow(QMainWindow):
         self._update_metrics()
 
         self._log_sig.connect(self._log.append_log)
+        self._log_no_type_sig.connect(self._log.append_log_no_type)
+        self._stream_sig.connect(self._log.stream_chunk)
         self._state_sig.connect(self._apply_state)
 
         self._overlay: SetupOverlay | None = None
@@ -1418,6 +1451,55 @@ class MainWindow(QMainWindow):
         if self.on_text_command:
             threading.Thread(target=self.on_text_command, args=(txt,), daemon=True).start()
 
+    def _setup_tray(self):
+        self.tray_icon = QSystemTrayIcon(self)
+        # Use face.png as icon
+        face_path = str(BASE_DIR / "face.png")
+        if os.path.exists(face_path):
+            self.tray_icon.setIcon(QIcon(face_path))
+        
+        tray_menu = QMenu()
+        show_action = QAction("Show Jarvis", self)
+        show_action.triggered.connect(self.show_window)
+        
+        hide_action = QAction("Hide Jarvis", self)
+        hide_action.triggered.connect(self.hide_to_tray)
+        
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(QApplication.instance().quit)
+        
+        tray_menu.addAction(show_action)
+        tray_menu.addAction(hide_action)
+        tray_menu.addSeparator()
+        tray_menu.addAction(quit_action)
+        
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self._tray_activated)
+        self.tray_icon.show()
+
+    def _tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            if self.isVisible():
+                self.hide_to_tray()
+            else:
+                self.show_window()
+
+    def show_window(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def hide_to_tray(self):
+        self.hide()
+
+    def closeEvent(self, event):
+        # Override close to minimize to tray instead of quitting
+        if self.tray_icon.isVisible():
+            self.hide_to_tray()
+            event.ignore()
+        else:
+            event.accept()
+
     def _apply_state(self, state: str):
         self.hud.state    = state
         self.hud.speaking = (state == "SPEAKING")
@@ -1508,6 +1590,12 @@ class JarvisUI:
 
     def write_log(self, text: str):
         self._win._log_sig.emit(text)
+
+    def write_log_no_type(self, text: str):
+        self._win._log_no_type_sig.emit(text)
+
+    def stream_chunk(self, chunk: str):
+        self._win._stream_sig.emit(chunk)
 
     def wait_for_api_key(self):
         """Renamed internally but kept for compatibility — waits for setup completion."""

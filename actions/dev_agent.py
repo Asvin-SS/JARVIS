@@ -571,6 +571,66 @@ def _build_project(
     return f"{msg}\n\nLast error:\n{last_output[:600]}"
 
 
+def build_jarvis_tool(description: str, speak=None, player=None) -> dict:
+    """
+    Specialized mode for creating new action tools for Jarvis itself.
+    """
+    def log(msg: str):
+        print(f"[DevAgent] {msg}")
+        if player: player.write_log(f"[DevAgent] {msg}")
+
+    # 1. Ask clarifying question (simulated here as we are in a tool call, 
+    # but in the real flow Jarvis should have asked this before calling the tool)
+    # Since we can't easily do a multi-turn here, we assume the description 
+    # already contains the answer or we just proceed with what we have.
+
+    log("Designing Jarvis tool...")
+    model = _get_model(MODEL_PLANNER)
+    
+    prompt = f"""
+    You are an expert Jarvis developer. Create a new action tool based on this description: {description}
+    
+    The tool must follow this exact pattern:
+    ```python
+    TOOL_SPEC = {{
+        "name": "tool_name",
+        "description": "Short description",
+        "parameters": {{
+            "type": "object",
+            "properties": {{
+                "param1": {{"type": "string", "description": "..."}}
+            }},
+            "required": ["param1"]
+        }}
+    }}
+
+    def run(parameters: dict, player=None) -> str:
+        # Implementation
+        return "Result message"
+    ```
+    
+    Return ONLY the Python code. No explanation.
+    """
+    
+    try:
+        response = model.generate_content(prompt)
+        code = _strip_fences(response.text)
+        
+        # Extract tool name from TOOL_SPEC in the code
+        name_match = re.search(r'"name":\s*"([^"]+)"', code)
+        tool_name = name_match.group(1) if name_match else "custom_tool"
+        
+        file_name = f"{tool_name}.py"
+        file_path = BASE_DIR / "actions" / file_name
+        file_path.write_text(code, encoding="utf-8")
+        
+        log(f"Tool {tool_name} created at {file_path}")
+        return {"name": tool_name, "path": str(file_path), "spec_code": code}
+        
+    except Exception as e:
+        log(f"Failed to build tool: {e}")
+        return {}
+
 def dev_agent(
     parameters: dict,
     response=None,

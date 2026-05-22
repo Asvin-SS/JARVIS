@@ -1,5 +1,4 @@
-﻿sounddevice
-llama-cpp-python
+sounddevice
 pillow
 requests
 beautifulsoup4
@@ -11,7 +10,6 @@ pygetwindow
 opencv-python
 numpy
 mss
-Pillow
 psutil
 comtypes
 pycaw
@@ -21,3 +19,15 @@ youtube-transcript-api
 pywinauto
 python-pptx
 pyqt6
+faster-whisper
+pyttsx3
+google-genai
+pdfplumber
+PyPDF2
+python-docx
+pandas
+openpyxl
+pvporcupine
+SpeechRecognition
+pyaudio
+winsound; platform_system == 'Windows'
