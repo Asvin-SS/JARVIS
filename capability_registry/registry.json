@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "capabilities": [
+    {"id": "voice_assistant", "status": "active", "module": "main.py"},
+    {"id": "ollama_llm", "status": "active", "module": "llm_client.py"},
+    {"id": "sqlite_memory", "status": "active", "module": "db/database.py"},
+    {"id": "dashboard", "status": "active", "module": "ui.py"},
+    {"id": "screen_vision", "status": "partial", "module": "actions/screen_processor.py"},
+    {"id": "self_build_tools", "status": "partial", "module": "actions/dev_agent.py"},
+    {"id": "multi_agent_planner", "status": "partial", "module": "agent/orchestrator.py"},
+    {"id": "azure_deploy", "status": "missing", "note": "Propose self_upgrade module on request"},
+    {"id": "local_rag", "status": "missing", "note": "Embeddings pipeline not yet implemented"}
+  ]
+}

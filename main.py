@@ -9,6 +9,7 @@ import io
 import json
 import re
 import sys
+import time
 import threading
 import traceback
 import importlib
@@ -41,11 +42,23 @@ except ImportError:
     _TTS_OK = False
     print("[JARVIS] pyttsx3 not installed — voice output disabled. pip install pyttsx3")
 
+# ── project infrastructure ────────────────────────────────────────────────────
+try:
+    from core.config import ensure_runtime_dirs
+    from core.logging_setup import setup_logging
+    ensure_runtime_dirs()
+    _jarvis_log = setup_logging("main")
+except ImportError:
+    _jarvis_log = None
+
 # ── project imports ───────────────────────────────────────────────────────────
 from ui import JarvisUI
 from memory.memory_manager import load_memory, update_memory, format_memory_for_prompt
 from llm_client import chat_with_tools, get_active_model, get_settings, warm_up_model, unified_chat
-from db.database import init_db, get_db, get_active_tasks, get_watchlist, add_session
+from db.database import (
+    init_db, get_db, get_active_tasks, get_watchlist, add_session,
+    save_task, log_conversation,
+)
 
 from actions.market_tracker    import run as market_tracker
 from actions.file_processor    import file_processor
@@ -75,6 +88,7 @@ def get_base_dir() -> Path:
 
 BASE_DIR    = get_base_dir()
 PROMPT_PATH = BASE_DIR / "core" / "prompt.txt"
+IDENTITY_PATH = BASE_DIR / "core" / "identity.txt"
 
 # ── audio constants ───────────────────────────────────────────────────────────
 MIC_SAMPLE_RATE  = 16_000   # Whisper expects 16 kHz
@@ -86,14 +100,109 @@ ENERGY_THRESHOLD = 300      # RMS threshold — tune up if too sensitive
 
 
 def _load_system_prompt() -> str:
+    parts = []
+    if IDENTITY_PATH.exists():
+        try:
+            parts.append(IDENTITY_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    if PROMPT_PATH.exists():
+        try:
+            parts.append(PROMPT_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    if parts:
+        return "\n\n".join(parts)
+    return (
+        "You are Mark-XXXIX, a personal AI assistant for SS. "
+        "Be concise and direct. Use tools when needed. Ask before external actions."
+    )
+
+
+def _is_yes(text: str) -> bool:
+    t = text.lower().strip()
+    return any(w in t for w in ("yes", "yeah", "yep", "sure", "ok", "okay", "please", "do it", "go ahead"))
+
+
+def _is_no(text: str) -> bool:
+    t = text.lower().strip()
+    return any(w in t for w in ("no", "nope", "don't", "skip", "not now", "later"))
+
+
+def _is_skip_all(text: str) -> bool:
+    t = text.lower().strip()
+    return any(w in t for w in ("skip all", "just start", "skip everything", "start listening"))
+
+
+def _speech_enabled() -> bool:
     try:
-        return PROMPT_PATH.read_text(encoding="utf-8")
+        from llm_client import get_settings
+        return bool(get_settings().get("speech_enabled", True))
     except Exception:
-        return (
-            "You are JARVIS, a highly capable local AI assistant. "
-            "Be concise and direct. Always use the provided tools to complete tasks. "
-            "Never simulate or guess results — always call the appropriate tool."
-        )
+        return True
+
+
+def _parse_voice_command(text: str) -> str | None:
+    """
+    When require_jarvis_prefix is on, ignore utterances that do not address Jarvis.
+    Reduces false triggers from TV / background conversation.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    try:
+        from llm_client import get_settings
+        if not get_settings().get("require_jarvis_prefix", True):
+            return raw
+    except Exception:
+        return raw
+
+    low = raw.lower()
+    prefixes = (
+        "jarvis,",
+        "hey jarvis,",
+        "hey jarvis ",
+        "jarvis ",
+        "jarvis do ",
+        "jarvis open ",
+        "jarvis create ",
+        "wake up jarvis ",
+    )
+    for p in prefixes:
+        if low.startswith(p):
+            rest = raw[len(p) :].strip()
+            return rest if rest else None
+    if low == "jarvis" or low.startswith("jarvis:"):
+        return raw.split(":", 1)[-1].strip() or None
+    return None
+
+
+def _apply_voice_controls(text: str, jarvis: "JarvisLocal") -> bool:
+    """Dynamic TTS volume commands. Returns True if consumed."""
+    low = text.lower()
+    from llm_client import get_settings, save_settings
+    s = get_settings()
+    if "raise your voice" in low or "speak louder" in low:
+        s["tts_rate"] = min(300, int(s.get("tts_rate", 175)) + 25)
+        save_settings(s)
+        jarvis._speak("Voice raised.")
+        return True
+    if "lower your voice" in low or "speak quieter" in low:
+        s["tts_rate"] = max(100, int(s.get("tts_rate", 175)) - 25)
+        save_settings(s)
+        jarvis._speak("Voice lowered.")
+        return True
+    if "mute yourself" in low and "unmute" not in low:
+        s["speech_enabled"] = False
+        save_settings(s)
+        jarvis.ui.write_log("SYS: Speech disabled (microphone still available).")
+        return True
+    if "restore normal voice" in low or "unmute yourself" in low:
+        s["speech_enabled"] = True
+        save_settings(s)
+        jarvis._speak("Speech restored.")
+        return True
+    return False
 
 
 # ── Tool declarations (same schema as before, passed to Ollama) ───────────────
@@ -706,7 +815,9 @@ class JarvisLocal:
         self._wake_listener = _WakeWordListener(self._on_wake)
         self._last_interaction = time.time()
         self._idle_timer_running = False
-        
+        self._greeting_step = 0  # 0 = normal; 2–5 = permission gates
+        self._skip_prefix_once = False  # after wake word, next utterance skips prefix
+
         # Task 13: TTS Queue
         self._tts_queue = queue.Queue()
         self._tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
@@ -716,12 +827,26 @@ class JarvisLocal:
         self.ui.on_text_command = self._on_text_command
         self.ui.on_close = self._on_close
         self.ui.on_mute_changed = self._on_mute_changed
+        self.ui.on_window_shown = self._on_window_shown
+        self.ui.on_window_hidden = self._on_window_hidden
+
+    def _on_window_shown(self):
+        """Window visible: voice recorder on, wake word off."""
+        self._last_interaction = time.time()
+        self._wake_listener.stop()
+        self._recorder.start()
+
+    def _on_window_hidden(self):
+        """Window hidden: voice recorder off, wake word on."""
+        self._recorder.stop()
+        if _SR_OK:
+            self._wake_listener.start()
 
     def _tts_worker(self):
-        """Dedicated thread for speaking from a queue."""
+        """Dedicated thread for speaking from a queue. Mic mute does NOT block TTS."""
         while True:
             text = self._tts_queue.get()
-            if self.ui.muted:
+            if not _speech_enabled():
                 self._tts_queue.task_done()
                 continue
                 
@@ -744,14 +869,13 @@ class JarvisLocal:
             self._tts_queue.task_done()
 
     def _on_mute_changed(self, muted: bool):
-        """Saves mute preference to DB."""
+        """Mic mute only — stops listener, not TTS or background agents."""
+        self._recorder.set_muted(muted)
         try:
-            conn = get_db()
-            cursor = conn.cursor()
-            cursor.execute("REPLACE INTO preferences (key, value) VALUES ('muted', ?)", (str(muted),))
-            conn.commit()
-            conn.close()
-        except Exception: pass
+            from db.database import set_preference
+            set_preference("mic_muted", str(muted))
+        except Exception:
+            pass
 
     def _on_close(self):
         """Task 12.4: Save session summary on close."""
@@ -769,7 +893,9 @@ class JarvisLocal:
 
     # ── public start ─────────────────────────────────────────────────
     def start(self):
-        # BUG 1 Fix: Warm up model on startup
+        if _jarvis_log:
+            _jarvis_log.info("JarvisLocal.start()")
+        threading.Thread(target=self._run_diagnostics_background, daemon=True).start()
         warm_up_model()
         
         model_info = get_active_model()
@@ -777,86 +903,157 @@ class JarvisLocal:
             f"SYS: JARVIS online — {model_info['provider']} / {model_info['model']}"
         )
         self.ui.set_state("LISTENING")
-        self._recorder.start()
-        self._wake_listener.start()
         self._start_idle_timer()
         
         print(f"[JARVIS] ✅ Started. Model: {model_info}")
         
-        # TASK 3: Startup greeting
-        threading.Thread(target=self._run_greeting, daemon=True).start()
-        
-        # Start minimized to tray as requested in TASK 2
-        self.ui._win.hide_to_tray()
+        from llm_client import get_settings
+        settings = get_settings()
+        if settings.get("run_greeting", True):
+            threading.Thread(target=self._run_greeting, daemon=True).start()
+        else:
+            self.ui.write_log("SYS: Ready.")
+
+        if settings.get("first_launch_complete", False) and settings.get("start_minimized", True):
+            self.ui.hide()
+        else:
+            settings["first_launch_complete"] = True
+            from llm_client import save_settings
+            save_settings(settings)
 
     def _run_greeting(self):
-        """Generates and speaks the startup greeting."""
+        """Step 1 greeting, then permission-gated steps 2–5."""
         now = datetime.now()
         hour = now.hour
-        if hour < 12: greeting_base = "Good morning, SS."
-        elif hour < 17: greeting_base = "Good afternoon, SS."
-        else: greeting_base = "Good evening, SS."
-        
-        # Get weather
-        weather_info = "Weather data unavailable."
-        try:
-            from actions.weather_report import weather_action
-            weather_info = weather_action({"city": "current location"})
-        except Exception:
-            pass
-            
-        # Get tasks
-        tasks = get_active_tasks()
-        task_info = f"You have {len(tasks)} pending tasks from last session." if tasks else "You have no active tasks."
-        if tasks:
-            task_info += f" Most recent: \"{tasks[0]['title']}\"."
-            
-        # Get watchlist
-        watchlist = get_watchlist()
-        watchlist_info = f"Your watchlist has {len(watchlist)} stocks." if watchlist else ""
-        
-        # Model info
-        model_info = get_active_model()
-        model_name = model_info['model']
-        
-        # Build prompt for LLM to format the greeting
-        prompt = f"""
-        Create a concise, professional Jarvis-style greeting based on this context:
-        - Base: {greeting_base}
-        - Time: {now.strftime("%I:%M %p")}
-        - Date: {now.strftime("%A, %B %d")}
-        - Weather: {weather_info}
-        - Tasks: {task_info}
-        - Watchlist: {watchlist_info}
-        - Model: {model_name}
-        
-        After the greeting, if there are pending tasks, ask: "Want me to recap your pending tasks?"
-        Return only the text to be spoken. Be brief and efficient.
-        """
-        
-        try:
-            formatted_greeting = unified_chat("You are JARVIS.", prompt)
-        except Exception:
-            formatted_greeting = f"{greeting_base} It is {now.strftime('%I:%M %p')}. {weather_info} {task_info} I'm running on {model_name}. Ready when you are."
+        if hour < 12:
+            period = "morning"
+        elif hour < 17:
+            period = "afternoon"
+        else:
+            period = "evening"
 
-        self.ui.write_log(f"Jarvis: {formatted_greeting}")
-        self._speak(formatted_greeting)
-        
-        # Store session
+        tasks = get_active_tasks()
+        model_name = get_active_model()["model"]
+        line = (
+            f"Good {period}, SS. Today is {now.strftime('%A, %B %d')}. "
+            f"The time is {now.strftime('%I:%M %p')}. "
+            f"I'm running on {model_name}."
+        )
+        if tasks:
+            line += f" You have {len(tasks)} active tasks from your last session."
+        line += " What would you like to do?"
+
+        self.ui.write_log(f"Jarvis: {line}")
+        self._speak(line)
         add_session(now.isoformat(), summary="Started session")
-        
-        # Update UI side panel (direct call or signal)
-        # This will be handled by the UI refresh timer but we can force it
         if hasattr(self.ui._win, "_refresh_side"):
             self.ui._win._refresh_side()
+
+        from llm_client import get_settings
+        if not get_settings().get("run_greeting", True):
+            return
+
+        self._greeting_step = 2
+        time.sleep(0.8)
+        self._greeting_ask("Should I pull today's weather?")
+
+    def _greeting_ask(self, question: str):
+        self.ui.write_log(f"Jarvis: {question}")
+        self._speak(question)
+
+    def _handle_greeting_reply(self, text: str) -> bool:
+        """Handle yes/no during startup permission sequence. Returns True if consumed."""
+        if self._greeting_step == 0:
+            return False
+        if _is_skip_all(text):
+            self._greeting_step = 0
+            self._speak("Understood. I'm listening, SS.")
+            if hasattr(self.ui._win, "_refresh_side"):
+                self.ui._win._refresh_side()
+            return True
+
+        step = self._greeting_step
+        yes, no = _is_yes(text), _is_no(text)
+
+        if step == 2:
+            if yes:
+                try:
+                    from llm_client import get_settings
+                    city = get_settings().get("weather_city") or "current location"
+                    from actions.weather_report import weather_action
+                    w = weather_action({"city": city})
+                    self.ui.write_log(f"Jarvis: {w[:400]}")
+                    self._speak(w[:200])
+                except Exception as e:
+                    self.ui.write_log(f"Jarvis: Could not fetch weather — {e}")
+            self._greeting_step = 3
+            self._greeting_ask("Want me to open Groww and check your watchlist?")
+            return True
+
+        if step == 3:
+            if yes:
+                try:
+                    from actions.browser_control import browser_control
+                    browser_control({"action": "open", "url": "https://groww.in"})
+                    from actions.market_tracker import run as market_tracker
+                    r = market_tracker({"action": "show_watchlist"})
+                    self.ui.write_log(f"Jarvis: {r}")
+                    self._speak(str(r)[:180])
+                except Exception as e:
+                    self.ui.write_log(f"Jarvis: {e}")
+            self._greeting_step = 4
+            self._greeting_ask("Should I get a quick world news summary?")
+            return True
+
+        if step == 4:
+            if yes:
+                try:
+                    r = web_search_action({"query": "world news today"})
+                    summary = str(r)[:500]
+                    self.ui.write_log(f"Jarvis: {summary}")
+                    self._speak(summary[:200])
+                except Exception as e:
+                    self.ui.write_log(f"Jarvis: News unavailable — {e}")
+            self._greeting_step = 5
+            self._greeting_ask("Want me to recap your pending tasks?")
+            return True
+
+        if step == 5:
+            if yes:
+                tasks = get_active_tasks()
+                if tasks:
+                    lines = "; ".join(t["title"] for t in tasks[:8])
+                    self.ui.write_log(f"Jarvis: Active tasks: {lines}")
+                    self._speak(f"You have {len(tasks)} tasks. {lines[:200]}")
+                else:
+                    self._speak("You have no active tasks.")
+            elif no and hasattr(self.ui._win, "_refresh_side"):
+                self.ui._win._refresh_side()
+            self._greeting_step = 0
+            self._speak("I'm listening, SS.")
+            return True
+
+        return False
+
+    def _run_diagnostics_background(self):
+        try:
+            from diagnostics.system_diagnostics import run_diagnostics
+            report = run_diagnostics()
+            fails = [k for k, v in report.items() if not v.get("ok")]
+            if fails and _jarvis_log:
+                _jarvis_log.warning("Diagnostics issues: %s", fails)
+        except Exception as e:
+            if _jarvis_log:
+                _jarvis_log.debug("Diagnostics skipped: %s", e)
 
     def _on_wake(self):
         """Called when wake word is detected."""
         print("[JARVIS] 🔔 Wake word detected!")
         self._last_interaction = time.time()
+        self._skip_prefix_once = True
         
-        # 1. Restore window
-        self.ui._win.show_window()
+        # 1. Restore window (starts recorder via on_window_shown)
+        self.ui.show()
         
         # 2. Play chime
         try:
@@ -866,7 +1063,7 @@ class JarvisLocal:
             pass
             
         # 3. Say "I'm listening"
-        self._speak("I'm listening, sir.")
+        self._speak("I'm listening, SS.")
         
         # 4. Flash mic indicator (already handled by set_state LISTENING which is called in _speak)
         self.ui.set_state("LISTENING")
@@ -877,10 +1074,11 @@ class JarvisLocal:
         def _timer():
             while True:
                 time.sleep(5)
-                if time.time() - self._last_interaction > 60:
+                if time.time() - self._last_interaction > 90:
                     if self.ui._win.isVisible() and self.ui.state == "LISTENING":
-                        print("[JARVIS] 💤 Idle for 60s, minimizing...")
-                        self.ui._win.hide_to_tray()
+                        print("[JARVIS] 💤 Idle for 90s, minimizing...")
+                        self._speak("Going quiet. Say Wake up Jarvis when you need me.")
+                        self.ui.hide()
         threading.Thread(target=_timer, daemon=True).start()
 
     # ── voice path ───────────────────────────────────────────────────
@@ -896,25 +1094,43 @@ class JarvisLocal:
             print("[JARVIS] ✋ Interrupted by voice!")
             self.interrupt_event.set()
             _tts.stop()
-            self.ui.write_log("Jarvis: [cancelled]")
+            self.ui.write_log("Jarvis: [cancelled — interrupted]")
         
         self.ui.set_state("THINKING")
         text = _transcribe(audio_np)
         if not text or len(text.strip()) < 2:
             self.ui.set_state("LISTENING")
             return
+        if not self._skip_prefix_once:
+            cmd = _parse_voice_command(text)
+            if cmd is None:
+                self.ui.set_state("LISTENING")
+                return
+            text = cmd
+        else:
+            self._skip_prefix_once = False
+
+        if _apply_voice_controls(text, self):
+            self.ui.set_state("LISTENING")
+            return
+
         self.ui.write_log(f"You: {text}")
-        self._process(text)
+        if self._handle_greeting_reply(text):
+            self.ui.set_state("LISTENING")
+            return
+        threading.Thread(target=self._process, args=(text,), daemon=True).start()
 
     # ── text path (from input box) ────────────────────────────────────
     def _on_text_command(self, text: str):
         self._last_interaction = time.time()
+        if self._handle_greeting_reply(text):
+            return
         # TASK 4 Fix: Handle interruption
         if self.ui.state in ("THINKING", "SPEAKING", "PROCESSING"):
             print("[JARVIS] ✋ Interrupted by text!")
             self.interrupt_event.set()
             _tts.stop()
-            self.ui.write_log("Jarvis: [cancelled]")
+            self.ui.write_log("Jarvis: [cancelled — interrupted]")
             
         self.ui.set_state("THINKING")
         threading.Thread(target=self._process, args=(text,), daemon=True).start()
@@ -924,7 +1140,8 @@ class JarvisLocal:
         """Send user_text to Ollama, handle tool calls, speak reply."""
         self.interrupt_event.clear()
         try:
-            system_prompt = self._build_system_prompt()
+            log_conversation("user", user_text)
+            system_prompt = self._build_system_prompt(user_text)
 
             with self._lock:
                 self._history.append({"role": "user", "content": user_text})
@@ -1034,8 +1251,8 @@ class JarvisLocal:
                     self._history = self._history[-40:]
 
             if full_content and not self.interrupt_event.is_set():
-                # End with a newline in log
                 self.ui.stream_chunk("\n")
+                log_conversation("assistant", full_content)
                 self._speak(full_content)
             else:
                 self.ui.set_state("LISTENING")
@@ -1043,9 +1260,15 @@ class JarvisLocal:
         except Exception as e:
             err = str(e)
             print(f"[JARVIS] ❌ Process error: {err}")
+            if _jarvis_log:
+                _jarvis_log.exception("Process error")
             traceback.print_exc()
             self.ui.write_log(f"ERR: {err[:120]}")
-            self._speak(f"Sir, I encountered an error. {err[:80]}")
+            hint = "Try a shorter question or check Ollama is running."
+            if "timed out" in err.lower():
+                hint = "Ollama timed out. Use a smaller model or wait for warm-up to finish."
+            self.ui.write_log(f"SYS: {hint}")
+            self._speak(f"SS, I hit an error. {hint}")
 
     # ── TTS output ────────────────────────────────────────────────────
     def _speak(self, text: str):
@@ -1053,7 +1276,7 @@ class JarvisLocal:
         self._tts_queue.put(text)
 
     # ── system prompt ─────────────────────────────────────────────────
-    def _build_system_prompt(self) -> str:
+    def _build_system_prompt(self, user_text: str = "") -> str:
         memory  = load_memory()
         mem_str = format_memory_for_prompt(memory)
         base    = _load_system_prompt()
@@ -1064,7 +1287,13 @@ class JarvisLocal:
         if mem_str:
             parts.append(mem_str)
         parts.append(base)
-        return "\n\n".join(parts)
+        merged = "\n\n".join(parts)
+        try:
+            from agent.orchestrator import enrich_system_prompt
+            merged = enrich_system_prompt(merged, user_text)
+        except ImportError:
+            pass
+        return merged
 
     # ── tool executor ─────────────────────────────────────────────────
     def _execute_tool(self, name: str, args: dict) -> Any:
@@ -1080,15 +1309,9 @@ class JarvisLocal:
                 desc = args.get("description", "")
                 cat = args.get("category", "personal")
                 try:
-                    conn = get_db()
-                    cursor = conn.cursor()
-                    now = datetime.now().isoformat()
-                    cursor.execute(
-                        "INSERT INTO tasks (created_at, updated_at, title, description, category) VALUES (?, ?, ?, ?, ?)",
-                        (now, now, title, desc, cat)
-                    )
-                    conn.commit()
-                    conn.close()
+                    save_task(title, desc, cat)
+                    if hasattr(ui._win, "_refresh_side"):
+                        ui._win._refresh_side()
                     return f"Task '{title}' saved successfully."
                 except Exception as e:
                     return f"Failed to save task: {e}"
@@ -1231,23 +1454,23 @@ class JarvisLocal:
 # ── entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    import time
-
-    # Initialize database
     init_db()
+    try:
+        ensure_runtime_dirs()
+    except NameError:
+        pass
 
     ui = JarvisUI("face.png")
 
     def runner():
-        ui.wait_for_api_key()   # actually waits for setup overlay to complete
+        ui.wait_for_api_key()
         jarvis = JarvisLocal(ui)
         jarvis.start()
-        # keep thread alive — all real work happens in callbacks
         while True:
             time.sleep(1)
 
     threading.Thread(target=runner, daemon=True).start()
-    ui.root.mainloop()
+    sys.exit(ui._app.exec())
 
 
 if __name__ == "__main__":

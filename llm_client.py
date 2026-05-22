@@ -10,14 +10,39 @@ import threading
 import time
 import requests as _requests
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+try:
+    from core.config import (
+        OLLAMA_HOST,
+        OLLAMA_MAX_RETRIES,
+        OLLAMA_RETRY_BACKOFF_BASE,
+        OLLAMA_TIMEOUT_SEC,
+        MAX_TOOLS_PER_REQUEST,
+    )
+    from core.logging_setup import setup_logging
+    _log = setup_logging("llm_client")
+except ImportError:
+    OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+    OLLAMA_TIMEOUT_SEC = int(os.environ.get("OLLAMA_TIMEOUT_SEC", "3600"))
+    OLLAMA_MAX_RETRIES = 3
+    OLLAMA_RETRY_BACKOFF_BASE = 2.0
+    MAX_TOOLS_PER_REQUEST = 12
+    _log = None
 
 BASE_DIR = Path(__file__).resolve().parent
+
+# Core tools when intent is unknown — avoids sending 20+ tools (major timeout cause)
+CORE_TOOL_NAMES = frozenset({
+    "save_memory", "save_task", "get_catchup", "weather_report", "open_app",
+    "browser_control", "web_search", "file_controller", "code_helper", "market_tracker",
+})
 CONFIG_DIR = BASE_DIR / "config"
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
 API_KEYS_PATH = CONFIG_DIR / "api_keys.json"
 
 RECOMMENDED_MODELS = [
+    {"name": "mistral:latest", "label": "Mistral",          "size_est": "~4 GB",  "tag": "balanced",     "desc": "Best all-rounder for coding, chat, and analysis"},
     {"name": "llama3.2",      "label": "Llama 3.2",        "size_est": "~2 GB",  "tag": "balanced",     "desc": "Meta's latest, best balance of speed and quality"},
     {"name": "llama3.1",      "label": "Llama 3.1",        "size_est": "~4 GB",  "tag": "balanced",     "desc": "Stronger reasoning than 3.2, needs more RAM"},
     {"name": "mistral",       "label": "Mistral 7B",       "size_est": "~4 GB",  "tag": "fast",         "desc": "Fast, great for summarisation and Q&A"},
@@ -33,7 +58,7 @@ RECOMMENDED_MODELS = [
 ]
 
 DEFAULT_OLLAMA_PREFERENCES = [
-    "llama3.2", "llama3.1", "mistral", "gemma2", "phi3", "deepseek-r1",
+    "mistral:latest", "mistral", "llama3.2", "llama3.1", "gemma2", "phi3", "deepseek-r1",
     "qwen2", "codellama", "mixtral", "solar", "neural-chat", "tinyllama",
 ]
 
@@ -66,7 +91,7 @@ def get_settings() -> dict[str, Any]:
     if not data:
         data = {
             "active_provider": "ollama",
-            "active_model": "llama3.2",
+            "active_model": "mistral:latest",
             "home_assistant": {},
             "smart_devices": [],
         }
@@ -79,7 +104,7 @@ def save_settings(data: dict[str, Any]) -> None:
 def get_active_model() -> dict[str, str]:
     settings = get_settings()
     provider = settings.get("active_provider", "ollama")
-    model = settings.get("active_model", "llama3.2")
+    model = settings.get("active_model", "mistral:latest")
     if provider == "ollama":
         installed = {m["name"] for m in _ollama_installed_model_names()}
         if model not in installed:
@@ -206,6 +231,11 @@ def _ollama_installed_model_names() -> list[dict[str, Any]]:
             unique[model["name"]] = model
     return list(unique.values())
 
+def get_ollama_models() -> list[str]:
+    """Returns a flat list of installed model names."""
+    return [m["name"] for m in _ollama_installed_model_names()]
+
+
 def get_ollama_model_catalog() -> dict[str, list[dict[str, Any]]]:
     installed = _ollama_installed_model_names()
     installed_names = {m["name"] for m in installed}
@@ -228,42 +258,100 @@ def get_ollama_model_catalog() -> dict[str, list[dict[str, Any]]]:
 
     return {"installed": installed, "recommended": recommended}
 
-def _ollama_chat(model: str, messages: list[dict], tools: list[dict] | None = None, timeout: int = None, stream: bool = False) -> Any:
+def _ollama_url(path: str) -> str:
+    return f"{OLLAMA_HOST.rstrip('/')}{path}"
+
+
+def _ollama_chat(
+    model: str,
+    messages: list[dict],
+    tools: list[dict] | None = None,
+    timeout: int | None = None,
+    stream: bool = False,
+    on_chunk: Callable[[str], None] | None = None,
+) -> Any:
     """
-    Calls Ollama's /api/chat endpoint.
-    Supports streaming if stream=True.
+    Ollama /api/chat with streaming and optional per-token callback.
+    Use chat_with_tools() for retries and tool filtering.
     """
     if timeout is None:
-        timeout = int(os.environ.get("OLLAMA_TIMEOUT_SEC", 600))
+        timeout = OLLAMA_TIMEOUT_SEC
 
     body: dict = {
         "model": model,
         "messages": messages,
         "stream": stream,
+        "options": {"num_ctx": 8192},
     }
     if tools:
-        body["tools"] = tools
+        body["tools"] = tools[:MAX_TOOLS_PER_REQUEST]
 
     try:
         if stream:
-            return _requests.post(
-                "http://localhost:11434/api/chat",
+            resp = _requests.post(
+                _ollama_url("/api/chat"),
                 json=body,
                 timeout=timeout,
-                stream=True
+                stream=True,
             )
-        else:
-            r = _requests.post(
-                "http://localhost:11434/api/chat",
-                json=body,
-                timeout=timeout,
-            )
-            r.raise_for_status()
-            return r.json()
+            resp.raise_for_status()
+            if on_chunk:
+                full = []
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    chunk = json.loads(line.decode("utf-8"))
+                    delta = (chunk.get("message") or {}).get("content", "")
+                    if delta:
+                        full.append(delta)
+                        on_chunk(delta)
+                    if chunk.get("done"):
+                        break
+                return {"message": {"content": "".join(full), "tool_calls": []}, "done": True}
+            return resp
+        r = _requests.post(_ollama_url("/api/chat"), json=body, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
     except _requests.exceptions.ConnectionError:
         raise RuntimeError("Ollama is not running. Start it with: ollama serve")
     except _requests.exceptions.Timeout:
         raise RuntimeError(f"Ollama timed out after {timeout}s")
+
+
+def _ollama_chat_with_retry(
+    model: str,
+    messages: list[dict],
+    tools: list[dict] | None = None,
+    timeout: int | None = None,
+    stream: bool = False,
+) -> Any:
+    """Exponential backoff; on retry shrink tool list and message history."""
+    last_err: Exception | None = None
+    msgs = list(messages)
+    toolset = list(tools) if tools else None
+
+    for attempt in range(OLLAMA_MAX_RETRIES):
+        try:
+            if _log:
+                _log.info(
+                    "Ollama request model=%s attempt=%s tools=%s msgs=%s",
+                    model, attempt + 1, len(toolset or []), len(msgs),
+                )
+            return _ollama_chat(model, msgs, tools=toolset, timeout=timeout, stream=stream)
+        except RuntimeError as e:
+            last_err = e
+            if "timed out" not in str(e).lower() and attempt >= OLLAMA_MAX_RETRIES - 1:
+                raise
+            if attempt < OLLAMA_MAX_RETRIES - 1:
+                wait = OLLAMA_RETRY_BACKOFF_BASE ** attempt
+                if _log:
+                    _log.warning("Ollama retry in %ss: %s", wait, e)
+                time.sleep(wait)
+                if toolset and len(toolset) > 4:
+                    toolset = toolset[:4]
+                if len(msgs) > 8:
+                    msgs = msgs[-8:]
+    raise last_err or RuntimeError("Ollama request failed")
 
 
 def _run_ollama_prompt(model: str, prompt: str, timeout: int = 60) -> str:
@@ -301,8 +389,11 @@ def get_relevant_tools(user_text: str, all_tools: list[dict]) -> list[dict]:
         "write": ["code_helper", "file_controller"],
         "build": ["dev_agent"],
         "task": ["agent_task"],
-        "stock": ["web_search"],
-        "market": ["web_search"],
+        "stock": ["market_tracker", "web_search"],
+        "market": ["market_tracker"],
+        "watchlist": ["market_tracker"],
+        "groww": ["market_tracker", "browser_control"],
+        "zerodha": ["market_tracker", "browser_control"],
         "flight": ["flight_finder"],
         "game": ["game_updater"],
         "steam": ["game_updater"],
@@ -318,13 +409,12 @@ def get_relevant_tools(user_text: str, all_tools: list[dict]) -> list[dict]:
         if kw in text:
             relevant_names.update(tool_names)
     
-    # If no keywords match, send a core set or all if preferred.
-    # Here we send a broader set if no specific intent is found.
+    # Unknown intent: send small core set only (not full registry — prevents 600s+ timeouts)
     if not relevant_names:
-        return all_tools
-    
-    # Filter tools based on detected names
-    return [t for t in all_tools if t["name"] in relevant_names or t["name"] == "save_memory"]
+        return [t for t in all_tools if t["name"] in CORE_TOOL_NAMES][:MAX_TOOLS_PER_REQUEST]
+
+    filtered = [t for t in all_tools if t["name"] in relevant_names or t["name"] == "save_memory"]
+    return filtered[:MAX_TOOLS_PER_REQUEST]
 
 
 def chat_with_tools(
@@ -346,19 +436,30 @@ def chat_with_tools(
     active_model    = selection["model"]
 
     if timeout is None:
-        timeout = int(os.environ.get("OLLAMA_TIMEOUT_SEC", 600))
+        timeout = OLLAMA_TIMEOUT_SEC
 
     full_messages = []
     if system_prompt:
         full_messages.append({"role": "system", "content": system_prompt})
-    full_messages.extend(messages)
+    full_messages.extend(messages[-24:])
 
-    # BUG 1 Fix: Filter tools based on user intent
     last_user_msg = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
-    relevant_tools = get_relevant_tools(last_user_msg, tools) if last_user_msg else tools
+    relevant_tools = get_relevant_tools(last_user_msg, tools) if last_user_msg else tools[:MAX_TOOLS_PER_REQUEST]
+
+    # Task-type model routing (coding / vision / reasoning)
+    if active_provider == "ollama" and last_user_msg:
+        try:
+            from core.model_router import route_model
+            routed = route_model(last_user_msg, active_model)
+            if routed:
+                active_model = routed
+        except ImportError:
+            pass
 
     if active_provider == "ollama":
-        return _ollama_chat(active_model, full_messages, tools=relevant_tools, timeout=timeout, stream=stream)
+        return _ollama_chat_with_retry(
+            active_model, full_messages, tools=relevant_tools, timeout=timeout, stream=stream
+        )
 
     # OpenAI-compatible fallback
     if active_provider == "openai":
@@ -389,29 +490,58 @@ def chat_with_tools(
 
 
 def warm_up_model():
-    """
-    Sends a small prompt to Ollama to load the model into memory.
-    """
+    """Load active Ollama model into RAM via /api/generate (local only)."""
     selection = get_active_model()
-    if selection["provider"] == "ollama":
-        model = selection["model"]
-        print(f"[JARVIS] Warming up {model}...")
-        try:
-            _ollama_chat(model, [{"role": "user", "content": "hi"}], stream=False, timeout=30)
-            print(f"[JARVIS] Model {model} ready")
-        except Exception as e:
-            print(f"[JARVIS] Warm-up failed: {e}")
+    if selection["provider"] != "ollama":
+        return
+    model = selection["model"]
+    print(f"[JARVIS] Warming up {model}...")
+    try:
+        r = _requests.post(
+            _ollama_url("/api/generate"),
+            json={"model": model, "prompt": ".", "stream": False},
+            timeout=min(120, OLLAMA_TIMEOUT_SEC),
+        )
+        r.raise_for_status()
+        print(f"[JARVIS] Model ready ✓")
+    except Exception as e:
+        print(f"[JARVIS] Warm-up failed: {e}")
+
+
+def get_model_catalog() -> dict[str, list[dict[str, Any]]]:
+    """Installed models + downloadable catalog for Settings UI."""
+    raw = get_ollama_model_catalog()
+    installed = raw.get("installed", [])
+    installed_names = {m["name"] for m in installed}
+    available = []
+    for entry in RECOMMENDED_MODELS:
+        base = entry["name"]
+        pull_name = base if ":" in base else f"{base}:latest"
+        available.append({
+            "name": entry.get("label", base),
+            "pull_name": pull_name,
+            "size_est": entry.get("size_est", ""),
+            "tag": entry.get("tag", "balanced"),
+            "desc": entry.get("desc", ""),
+            "installed": pull_name in installed_names or base in installed_names,
+        })
+    return {"installed": installed, "available": available}
 
 
 def is_ollama_running() -> bool:
     """Quick health check — used by setup panel."""
     try:
-        r = _requests.get("http://localhost:11434/api/tags", timeout=3)
+        r = _requests.get(_ollama_url("/api/tags"), timeout=10)
         return r.status_code == 200
     except Exception:
         return False
 
-def pull_model(model: str, progress_callback: Any | None = None, stop_event: threading.Event | None = None) -> None:
+def pull_model(
+    model: str,
+    progress_callback: Any | None = None,
+    stop_event: threading.Event | None = None,
+) -> None:
+    """Run `ollama pull`; on_progress(percent, speed_str) when parseable."""
     proc = subprocess.Popen(
         ["ollama", "pull", model],
         stdout=subprocess.PIPE,
@@ -425,12 +555,26 @@ def pull_model(model: str, progress_callback: Any | None = None, stop_event: thr
             if stop_event and stop_event.is_set():
                 proc.kill()
                 break
+            raw = line.rstrip()
             if progress_callback:
-                progress_callback(line.rstrip())
+                pct = None
+                speed = ""
+                if "%" in raw:
+                    import re
+                    m = re.search(r"(\d+)%", raw)
+                    if m:
+                        pct = int(m.group(1))
+                    sm = re.search(r"([\d.]+\s*[KMGT]?B/s)", raw, re.I)
+                    if sm:
+                        speed = sm.group(1)
+                if pct is not None:
+                    progress_callback(pct, speed or raw)
+                else:
+                    progress_callback(raw, "")
     finally:
-        proc.wait(timeout=30)
+        proc.wait(timeout=3600)
         if progress_callback:
-            progress_callback("__complete__")
+            progress_callback("__complete__", "")
 
 def remove_model(model: str) -> None:
     result = subprocess.run(["ollama", "rm", model], capture_output=True, text=True, timeout=30)

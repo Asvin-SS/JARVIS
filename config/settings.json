@@ -3,5 +3,6 @@
   "active_model": "mistral:latest",
   "home_assistant": {},
   "smart_devices": [],
-  "os_system": "windows"
+  "os_system": "windows",
+  "first_launch_complete": true
 }
