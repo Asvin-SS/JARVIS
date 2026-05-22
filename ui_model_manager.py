@@ -18,7 +18,7 @@ from llm_client import (
 class ModelManagerDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Model Manager — MARK-3.9")
+        self.setWindowTitle("Settings — Mark-3.9")
         self.resize(550, 650)
         self.setStyleSheet("background: #00060a; color: #8ffcff;")
         self._setup_ui()

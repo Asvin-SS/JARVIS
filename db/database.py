@@ -76,6 +76,17 @@ def init_db():
     )
     ''')
 
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS self_built_tools (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        description TEXT,
+        requested_by TEXT
+    )
+    ''')
+
     conn.commit()
     conn.close()
     print(f"[DB] Database initialized at {DB_PATH}")
@@ -104,6 +115,91 @@ def add_session(started_at, summary=None):
     session_id = cursor.lastrowid
     conn.close()
     return session_id
+
+
+def get_preference(key: str, default: str | None = None) -> str | None:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM preferences WHERE key = ?", (key,))
+    row = cur.fetchone()
+    conn.close()
+    return row["value"] if row else default
+
+
+def set_preference(key: str, value: str) -> None:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "REPLACE INTO preferences (key, value) VALUES (?, ?)",
+        (key, str(value)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def save_task(title: str, description: str = "", category: str = "personal") -> int:
+    now = datetime.now().isoformat()
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO tasks (created_at, updated_at, title, description, status, category)
+           VALUES (?, ?, ?, ?, 'active', ?)""",
+        (now, now, title, description, category),
+    )
+    conn.commit()
+    tid = cur.lastrowid
+    conn.close()
+    return tid
+
+
+def complete_task(title_substring: str) -> bool:
+    conn = get_db()
+    cur = conn.cursor()
+    now = datetime.now().isoformat()
+    cur.execute(
+        """UPDATE tasks SET status = 'completed', updated_at = ?
+           WHERE status = 'active' AND title LIKE ?""",
+        (now, f"%{title_substring}%"),
+    )
+    conn.commit()
+    ok = cur.rowcount > 0
+    conn.close()
+    return ok
+
+
+def add_watchlist_symbol(symbol: str, label: str | None = None) -> None:
+    now = datetime.now().isoformat()
+    sym = symbol.upper().strip()
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO watchlist (symbol, label, added_at) VALUES (?, ?, ?)",
+        (sym, label or sym, now),
+    )
+    conn.commit()
+    conn.close()
+
+
+def remove_watchlist_symbol(symbol: str) -> bool:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM watchlist WHERE symbol = ?", (symbol.upper().strip(),))
+    conn.commit()
+    ok = cur.rowcount > 0
+    conn.close()
+    return ok
+
+
+def log_conversation(role: str, content: str, session_id: str | None = None) -> None:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO conversations (timestamp, role, content, session_id) VALUES (?, ?, ?, ?)",
+        (datetime.now().isoformat(), role, content, session_id),
+    )
+    conn.commit()
+    conn.close()
+
 
 if __name__ == "__main__":
     init_db()
