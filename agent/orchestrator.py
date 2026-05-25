@@ -51,11 +51,6 @@ def infer_plan(user_text: str) -> AgentPlan:
 
 
 def enrich_system_prompt(base: str, user_text: str) -> str:
-    """Inject agent plan into system prompt for smarter replies."""
+    """Light intent hint only — never dump plans into user-visible replies."""
     plan = infer_plan(user_text)
-    extra = (
-        f"\n[AGENT PLAN]\nIntent: {plan.intent}\n"
-        f"Agents: {', '.join(plan.agents)}\n"
-        f"Steps: {'; '.join(plan.steps)}\n"
-    )
-    return base + extra
+    return base + f"\n[Intent: {plan.intent} — use tools; reply in 1-4 sentences, no system dump.]\n"

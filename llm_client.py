@@ -35,7 +35,8 @@ BASE_DIR = Path(__file__).resolve().parent
 # Core tools when intent is unknown — avoids sending 20+ tools (major timeout cause)
 CORE_TOOL_NAMES = frozenset({
     "save_memory", "save_task", "get_catchup", "weather_report", "open_app",
-    "browser_control", "web_search", "file_controller", "code_helper", "market_tracker",
+    "browser_control", "web_search", "file_controller", "code_helper",
+    "coding_bridge", "market_tracker", "system_access",
 })
 CONFIG_DIR = BASE_DIR / "config"
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
@@ -88,17 +89,41 @@ def get_anthropic_api_key() -> str | None:
 
 def get_settings() -> dict[str, Any]:
     data = _load_json(SETTINGS_PATH)
+    defaults = {
+        "start_minimized": False,
+        "require_jarvis_prefix": False,
+        "speech_enabled": True,
+        "language_mode": "tanglish",
+        "stt_language": "auto",
+        "whisper_model": "small",
+        "run_greeting_steps": False,
+        "auto_hardware_model": True,
+        "auto_pull_model": True,
+        "weather_city": "Chennai",
+    }
+    for k, v in defaults.items():
+        if k not in data:
+            data[k] = v
     if not data:
         data = {
             "active_provider": "ollama",
             "active_model": "mistral:latest",
             "home_assistant": {},
             "smart_devices": [],
+            "start_minimized": False,
+            "require_jarvis_prefix": False,
+            "speech_enabled": True,
+            "language_mode": "tanglish",
+            "stt_language": "auto",
+            "vision_backend": "auto",
+            "vision_model": "llava:latest",
         }
         _save_json(SETTINGS_PATH, data)
     return data
 
 def save_settings(data: dict[str, Any]) -> None:
+    if "speech_enabled" not in data:
+        data["speech_enabled"] = True
     _save_json(SETTINGS_PATH, data)
 
 def get_active_model() -> dict[str, str]:
@@ -374,7 +399,11 @@ def get_relevant_tools(user_text: str, all_tools: list[dict]) -> list[dict]:
         "search": ["web_search", "browser_control"],
         "find": ["web_search", "file_controller", "flight_finder"],
         "file": ["file_controller", "file_processor"],
-        "folder": ["file_controller"],
+        "open": ["open_app", "system_access", "browser_control"],
+        "vscode": ["system_access", "coding_agent"],
+        "terminal": ["system_access"],
+        "powershell": ["system_access"],
+        "folder": ["file_controller", "system_access"],
         "message": ["send_message"],
         "whatsapp": ["send_message"],
         "telegram": ["send_message"],
@@ -385,7 +414,14 @@ def get_relevant_tools(user_text: str, all_tools: list[dict]) -> list[dict]:
         "camera": ["screen_process"],
         "volume": ["computer_settings"],
         "brightness": ["computer_settings"],
-        "code": ["code_helper", "dev_agent"],
+        "code": ["code_helper", "dev_agent", "coding_agent", "coding_bridge"],
+        "debug": ["coding_agent", "coding_bridge", "optimizely_agent"],
+        "error": ["coding_agent", "optimizely_agent"],
+        "optimizely": ["optimizely_agent"],
+        "occ": ["optimizely_agent"],
+        "trade": ["trading_briefing", "market_tracker"],
+        "briefing": ["trading_briefing"],
+        "upgrade": ["self_upgrade"],
         "write": ["code_helper", "file_controller"],
         "build": ["dev_agent"],
         "task": ["agent_task"],
@@ -485,6 +521,42 @@ def chat_with_tools(
         data = r.json()
         choice = data["choices"][0]["message"]
         return {"message": choice}
+
+    if active_provider == "anthropic":
+        key = get_anthropic_api_key()
+        if not key:
+            raise RuntimeError("Anthropic API key not configured. Add it in Settings → Models.")
+        try:
+            import anthropic
+        except ImportError:
+            raise RuntimeError("Install anthropic: pip install anthropic")
+        client = anthropic.Anthropic(api_key=key)
+        anth_tools = []
+        for t in relevant_tools:
+            anth_tools.append({
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "input_schema": t.get("parameters", {"type": "object", "properties": {}}),
+            })
+        anth_messages = [m for m in full_messages if m["role"] != "system"]
+        sys_msg = next((m["content"] for m in full_messages if m["role"] == "system"), "")
+        response = client.messages.create(
+            model=active_model or "claude-sonnet-4-20250514",
+            max_tokens=2048,
+            system=sys_msg,
+            messages=anth_messages,
+            tools=anth_tools if anth_tools else anthropic.NOT_GIVEN,
+        )
+        text_content = ""
+        tool_calls = []
+        for block in response.content:
+            if block.type == "text":
+                text_content += block.text
+            elif block.type == "tool_use":
+                tool_calls.append({
+                    "function": {"name": block.name, "arguments": block.input},
+                })
+        return {"message": {"content": text_content, "tool_calls": tool_calls}}
 
     raise RuntimeError(f"Provider '{active_provider}' not supported for tool chat.")
 

@@ -36,13 +36,22 @@ except ImportError:
 from google import genai
 from google.genai import types as gtypes
 
-def _base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
+try:
+    from core.paths import get_project_root
+    _BASE = get_project_root()
+except ImportError:
+    def _base_dir() -> Path:
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).parent
+        p = Path(__file__).resolve()
+        for _ in range(5):
+            if (p / "config").exists() or (p / "main.py").exists():
+                return p
+            p = p.parent
+        return Path(__file__).resolve().parent.parent
 
+    _BASE = _base_dir()
 
-_BASE        = _base_dir()
 _CONFIG_PATH = _BASE / "config" / "api_keys.json"
 
 
@@ -430,15 +439,26 @@ def screen_process(
 
     if action == "stop_watch":
         _watching = False
+        try:
+            from ui.screen_overlay import hide_screen_preview
+            hide_screen_preview()
+        except Exception:
+            pass
         print("[Vision] 🛑 Stopped watching screen")
         return True
 
     if action == "watch" or "watch" in user_text.lower() or "monitor" in user_text.lower():
         if not _watching:
             _watching = True
+            try:
+                from ui.screen_overlay import show_screen_preview
+                show_screen_preview()
+            except Exception:
+                pass
             _watch_thread = threading.Thread(target=_watch_loop, kwargs={"player": player, "speak": speak}, daemon=True)
             _watch_thread.start()
-            if speak: speak("I'm watching your screen now, sir.")
+            if speak:
+                speak("I'm watching your screen now, SS.")
             return True
         else:
             return "I'm already watching your screen."
@@ -466,8 +486,35 @@ def screen_process(
         print(f"[Vision] ❌ Capture error: {e}")
         return False
 
-    _session.analyze(image_bytes, mime_type, user_text)
-    return True
+    # Prefer local Ollama vision (llava) — no Gemini required
+    try:
+        from llm_client import get_settings
+        backend = (get_settings().get("vision_backend") or "auto").lower()
+        if backend != "gemini":
+            from core.vision_backend import analyze_image
+            try:
+                from ui.screen_overlay import show_screen_preview
+                show_screen_preview(image_bytes)
+            except Exception:
+                pass
+            result = analyze_image(image_bytes, user_text, mime_type)
+            msg = result[:2000]
+            print(f"[Vision] ✅ {msg[:120]}...")
+            if speak:
+                speak(msg[:400])
+            if player and hasattr(player, "write_log"):
+                player.write_log(f"Jarvis: {msg}")
+            return msg
+    except Exception as e:
+        print(f"[Vision] Ollama path failed, trying Gemini live: {e}")
+
+    try:
+        _ensure_session(player=player)
+        _session.analyze(image_bytes, mime_type, user_text)
+        return True
+    except Exception as e:
+        print(f"[Vision] ❌ Analysis failed: {e}")
+        return str(e)
 
 
 def warmup_session(player=None) -> None:

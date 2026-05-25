@@ -47,6 +47,9 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._tab_models(), "Models")
         tabs.addTab(self._tab_voice(), "Voice")
         tabs.addTab(self._tab_smart_home(), "Smart Home")
+        tabs.addTab(self._tab_trading(), "Trading")
+        tabs.addTab(self._tab_coding(), "Coding")
+        tabs.addTab(self._tab_github(), "GitHub")
         tabs.addTab(self._tab_startup(), "Startup")
         tabs.addTab(self._tab_about(), "About")
         root.addWidget(tabs)
@@ -111,9 +114,18 @@ class SettingsDialog(QDialog):
         self._speech_on = QCheckBox("Enable speech (TTS on every reply)")
         self._speech_on.setChecked(True)
         self._require_prefix = QCheckBox('Require "Jarvis" prefix on voice commands')
-        self._require_prefix.setChecked(True)
+        self._require_prefix.setChecked(False)
+        self._lang_mode = QComboBox()
+        self._lang_mode.addItems(["tanglish", "english", "tamil"])
+        self._stt_lang = QComboBox()
+        self._stt_lang.addItems(["auto", "en", "ta"])
+        self._whisper_model = QComboBox()
+        self._whisper_model.addItems(["small", "base", "medium"])
         lay.addRow(self._speech_on)
         lay.addRow(self._require_prefix)
+        lay.addRow("Reply language:", self._lang_mode)
+        lay.addRow("Speech-to-text:", self._stt_lang)
+        lay.addRow("Whisper model:", self._whisper_model)
         self._wake_sens = QComboBox()
         self._wake_sens.addItems(["Low", "Medium", "High"])
         lay.addRow("Wake word sensitivity:", self._wake_sens)
@@ -144,6 +156,63 @@ class SettingsDialog(QDialog):
         lay.addWidget(self._ha_status)
         lay.addStretch()
         return w
+
+    def _tab_trading(self) -> QWidget:
+        w = QWidget()
+        lay = QFormLayout(w)
+        self._watch_symbols = QLineEdit()
+        self._watch_symbols.setPlaceholderText("RELIANCE.NS, TCS.NS, INFY.NS")
+        self._trade_risk = QComboBox()
+        self._trade_risk.addItems(["Conservative", "Moderate", "Aggressive"])
+        self._broker_key = QLineEdit()
+        self._broker_key.setEchoMode(QLineEdit.EchoMode.Password)
+        lay.addRow("Watchlist symbols:", self._watch_symbols)
+        lay.addRow("Risk preference:", self._trade_risk)
+        lay.addRow("Broker API key:", self._broker_key)
+        lay.addRow("", QLabel("Daily briefing runs once per day on first startup."))
+        return w
+
+    def _tab_coding(self) -> QWidget:
+        w = QWidget()
+        lay = QFormLayout(w)
+        self._aider_key = QLineEdit()
+        self._aider_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._default_repo = QLineEdit()
+        self._occ_project = QLineEdit()
+        lay.addRow("Aider API key (optional):", self._aider_key)
+        lay.addRow("Default repo path:", self._default_repo)
+        lay.addRow("Optimizely project path:", self._occ_project)
+        return w
+
+    def _tab_github(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        form = QFormLayout()
+        self._github_token = QLineEdit()
+        self._github_token.setEchoMode(QLineEdit.EchoMode.Password)
+        self._github_remote = QLineEdit()
+        self._auto_commit = QCheckBox("Auto-commit on self-upgrade")
+        form.addRow("GitHub token:", self._github_token)
+        form.addRow("Repository URL:", self._github_remote)
+        lay.addLayout(form)
+        lay.addWidget(self._auto_commit)
+        search_btn = QPushButton("Search GitHub for Jarvis features")
+        search_btn.clicked.connect(self._search_github_features)
+        lay.addWidget(search_btn)
+        self._github_results = QLabel("")
+        self._github_results.setWordWrap(True)
+        lay.addWidget(self._github_results)
+        lay.addStretch()
+        return w
+
+    def _search_github_features(self):
+        try:
+            from self_upgrade.upgrade_manager import github_feature_search
+            hits = github_feature_search("voice assistant")
+            lines = [f"★ {h.get('name')} — {h.get('url')}" for h in hits if "error" not in h]
+            self._github_results.setText("\n".join(lines) or str(hits))
+        except Exception as e:
+            self._github_results.setText(str(e))
 
     def _tab_startup(self) -> QWidget:
         w = QWidget()
@@ -191,11 +260,30 @@ class SettingsDialog(QDialog):
         self._ha_url.setText(ha.get("url", ""))
         self._ha_token.setText(ha.get("token", ""))
         self._speech_on.setChecked(settings.get("speech_enabled", True))
-        self._require_prefix.setChecked(settings.get("require_jarvis_prefix", True))
-        self._chk_tray.setChecked(settings.get("start_minimized", True))
+        self._require_prefix.setChecked(settings.get("require_jarvis_prefix", False))
+        lm = (settings.get("language_mode") or "tanglish").lower()
+        self._lang_mode.setCurrentIndex(max(0, ["tanglish", "english", "tamil"].index(lm) if lm in ("tanglish", "english", "tamil") else 0))
+        sl = (settings.get("stt_language") or "auto").lower()
+        self._stt_lang.setCurrentIndex(max(0, ["auto", "en", "ta"].index(sl) if sl in ("auto", "en", "ta") else 0))
+        wm = (settings.get("whisper_model") or "small").lower()
+        self._whisper_model.setCurrentIndex(max(0, ["small", "base", "medium"].index(wm) if wm in ("small", "base", "medium") else 0))
+        self._chk_tray.setChecked(settings.get("start_minimized", False))
         self._chk_greeting.setChecked(settings.get("run_greeting", True))
         self._chk_tasks.setChecked(settings.get("show_tasks_startup", True))
-        self._weather_city.setText(settings.get("weather_city", ""))
+        self._weather_city.setText(settings.get("weather_city", "Chennai"))
+        trading = settings.get("trading", {}) or {}
+        self._watch_symbols.setText(trading.get("symbols", ""))
+        risk = (trading.get("risk") or "moderate").lower()
+        self._trade_risk.setCurrentIndex({"conservative": 0, "moderate": 1, "aggressive": 2}.get(risk, 1))
+        self._broker_key.setText(trading.get("broker_api_key", ""))
+        coding = settings.get("coding", {}) or {}
+        self._aider_key.setText(coding.get("aider_api_key", ""))
+        self._default_repo.setText(coding.get("default_repo", ""))
+        self._occ_project.setText(coding.get("optimizely_path", ""))
+        gh = settings.get("github", {}) or {}
+        self._github_token.setText(gh.get("token", ""))
+        self._github_remote.setText(gh.get("remote_url", ""))
+        self._auto_commit.setChecked(settings.get("auto_commit_upgrades", False))
         self._reload_models()
         self._reload_catalog()
 
@@ -342,6 +430,9 @@ class SettingsDialog(QDialog):
         settings["wake_sensitivity"] = sens
         settings["speech_enabled"] = self._speech_on.isChecked()
         settings["require_jarvis_prefix"] = self._require_prefix.isChecked()
+        settings["language_mode"] = self._lang_mode.currentText()
+        settings["stt_language"] = self._stt_lang.currentText()
+        settings["start_minimized"] = self._chk_tray.isChecked()
         settings["home_assistant"] = {
             "url": self._ha_url.text().strip(),
             "token": self._ha_token.text().strip(),
@@ -350,6 +441,22 @@ class SettingsDialog(QDialog):
         settings["run_greeting"] = self._chk_greeting.isChecked()
         settings["show_tasks_startup"] = self._chk_tasks.isChecked()
         settings["weather_city"] = self._weather_city.text().strip()
+        settings["whisper_model"] = self._whisper_model.currentText()
+        settings["trading"] = {
+            "symbols": self._watch_symbols.text().strip(),
+            "risk": self._trade_risk.currentText().lower(),
+            "broker_api_key": self._broker_key.text().strip(),
+        }
+        settings["coding"] = {
+            "aider_api_key": self._aider_key.text().strip(),
+            "default_repo": self._default_repo.text().strip(),
+            "optimizely_path": self._occ_project.text().strip(),
+        }
+        settings["github"] = {
+            "token": self._github_token.text().strip(),
+            "remote_url": self._github_remote.text().strip(),
+        }
+        settings["auto_commit_upgrades"] = self._auto_commit.isChecked()
         save_settings(settings)
         try:
             from llm_client import _save_json, API_KEYS_PATH, CONFIG_DIR

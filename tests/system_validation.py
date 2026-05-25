@@ -9,12 +9,19 @@ sys.path.insert(0, str(ROOT))
 
 
 def test_db_init():
-    from db.database import init_db, save_task, get_active_tasks, DB_PATH
+    from db.database import init_db, save_task, get_active_tasks, get_db, DB_PATH
     init_db()
     assert DB_PATH.exists()
     save_task("validation-test", "auto test", "test")
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) AS n FROM tasks WHERE title = 'validation-test'")
+    assert cur.fetchone()["n"] >= 1
     tasks = get_active_tasks()
-    assert any("validation-test" in t["title"] for t in tasks)
+    assert not any("validation-test" in t["title"] for t in tasks)
+    conn.execute("DELETE FROM tasks WHERE title = 'validation-test'")
+    conn.commit()
+    conn.close()
 
 
 def test_weather_cache():

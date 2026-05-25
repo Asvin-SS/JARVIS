@@ -3,23 +3,26 @@ from __future__ import annotations
 
 from core.config import MODEL_ROLES
 
+ROUTING_RULES: list[tuple[list[str], str]] = [
+    (["optimizely", "occ", "insite", "handler", ".net", "c#", "iis", "elastic"], "reasoning"),
+    (["debug", "fix", "error", "exception", "traceback", "stack trace"], "coding"),
+    (["code", "write", "function", "class", "implement", "refactor"], "coding"),
+    (["trade", "stock", "nse", "bse", "market", "portfolio", "groww"], "general"),
+    (["screen", "screenshot", "image", "look at", "vision", "camera"], "vision"),
+    (["reason", "think", "explain", "why", "analyze", "plan"], "reasoning"),
+]
+
 
 def route_model(user_text: str, default_model: str) -> str:
-    """
-    Pick best local model name for the utterance.
-    Falls back to default_model if role model not configured in settings override.
-    """
+    """Pick best local model name for the utterance."""
     t = (user_text or "").lower()
     settings_override = _settings_role_models()
 
-    if any(k in t for k in ("screen", "screenshot", "what's on", "look at my", "vision", "image")):
-        return settings_override.get("vision") or MODEL_ROLES["vision"]
-
-    if any(k in t for k in ("code", "debug", "refactor", "compile", "syntax", "class ", "function ", ".cs", ".tsx", "react", "dotnet", "elastic")):
-        return settings_override.get("coding") or MODEL_ROLES["coding"]
-
-    if any(k in t for k in ("plan", "architecture", "design", "why ", "explain step", "optimizely", "configured commerce")):
-        return settings_override.get("reasoning") or MODEL_ROLES["reasoning"]
+    for keywords, role in ROUTING_RULES:
+        if any(k in t for k in keywords):
+            if role == "general":
+                return default_model
+            return settings_override.get(role) or MODEL_ROLES.get(role, default_model)
 
     if any(k in t for k in ("summarize", "summary", "recap", "catch me up")):
         return settings_override.get("summary") or MODEL_ROLES["summary"]

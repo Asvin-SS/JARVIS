@@ -8,14 +8,23 @@ from pathlib import Path
 
 from config import is_windows, is_mac, is_linux
 
-def _get_base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
+try:
+    from core.paths import API_KEYS_PATH, get_project_root
+    BASE_DIR = get_project_root()
+    API_CONFIG_PATH = API_KEYS_PATH
+except ImportError:
+    def _get_base_dir() -> Path:
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).parent
+        p = Path(__file__).resolve()
+        for _ in range(5):
+            if (p / "config").exists() or (p / "main.py").exists():
+                return p
+            p = p.parent
+        return Path(__file__).resolve().parent.parent
 
-
-BASE_DIR        = _get_base_dir()
-API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
+    BASE_DIR = _get_base_dir()
+    API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
 
 def _get_api_key() -> str:
