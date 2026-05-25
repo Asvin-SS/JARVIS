@@ -90,22 +90,72 @@ def init_db():
     conn.commit()
     conn.close()
     print(f"[DB] Database initialized at {DB_PATH}")
+    ensure_watchlist_table()
+
+
+def ensure_watchlist_table(conn=None):
+    close = False
+    if conn is None:
+        conn = get_db()
+        close = True
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS watchlist (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol   TEXT    UNIQUE NOT NULL,
+            label    TEXT,
+            added_at TEXT    DEFAULT (datetime('now'))
+        )
+    """)
+    conn.commit()
+    if close:
+        conn.close()
+
+
+def get_watchlist() -> list[dict]:
+    conn = get_db()
+    ensure_watchlist_table(conn)
+    cur = conn.cursor()
+    cur.execute("SELECT symbol, label, added_at FROM watchlist ORDER BY added_at")
+    rows = [{"symbol": r[0], "label": r[1] or r[0], "added_at": r[2]} for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def add_watchlist_symbol(symbol: str, label: str | None = None) -> bool:
+    sym = symbol.upper().strip()
+    conn = get_db()
+    ensure_watchlist_table(conn)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO watchlist (symbol, label, added_at) VALUES (?, ?, datetime('now'))",
+        (sym, label or sym),
+    )
+    added = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return added
+
 
 def get_active_tasks():
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM tasks WHERE status = 'active' ORDER BY updated_at DESC")
+    cursor.execute(
+        "SELECT * FROM tasks WHERE status = 'active' AND category != 'test' ORDER BY updated_at DESC"
+    )
     rows = cursor.fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
-def get_watchlist():
+
+def remove_watchlist_symbol(symbol: str) -> bool:
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM watchlist")
-    rows = cursor.fetchall()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM watchlist WHERE symbol = ?", (symbol.upper().strip(),))
+    conn.commit()
+    ok = cur.rowcount > 0
     conn.close()
-    return [dict(r) for r in rows]
+    return ok
+
 
 def add_session(started_at, summary=None):
     conn = get_db()
@@ -161,29 +211,6 @@ def complete_task(title_substring: str) -> bool:
            WHERE status = 'active' AND title LIKE ?""",
         (now, f"%{title_substring}%"),
     )
-    conn.commit()
-    ok = cur.rowcount > 0
-    conn.close()
-    return ok
-
-
-def add_watchlist_symbol(symbol: str, label: str | None = None) -> None:
-    now = datetime.now().isoformat()
-    sym = symbol.upper().strip()
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR REPLACE INTO watchlist (symbol, label, added_at) VALUES (?, ?, ?)",
-        (sym, label or sym, now),
-    )
-    conn.commit()
-    conn.close()
-
-
-def remove_watchlist_symbol(symbol: str) -> bool:
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM watchlist WHERE symbol = ?", (symbol.upper().strip(),))
     conn.commit()
     ok = cur.rowcount > 0
     conn.close()

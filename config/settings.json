@@ -1,8 +1,59 @@
-{
-  "active_provider": "ollama",
-  "active_model": "mistral:latest",
-  "home_assistant": {},
-  "smart_devices": [],
-  "os_system": "windows",
-  "first_launch_complete": true
-}
+{
+  "active_provider": "ollama",
+  "active_model": "llama3.1:8b",
+  "home_assistant": {
+    "url": "",
+    "token": ""
+  },
+  "smart_devices": [],
+  "os_system": "windows",
+  "first_launch_complete": true,
+  "start_minimized": false,
+  "require_jarvis_prefix": false,
+  "speech_enabled": true,
+  "language_mode": "tanglish",
+  "stt_language": "auto",
+  "whisper_model": "small",
+  "run_greeting_steps": false,
+  "auto_hardware_model": false,
+  "auto_pull_model": false,
+  "weather_city": "Chennai",
+  "model_roles": {
+    "coding": "codellama:latest",
+    "reasoning": "llama3.1:8b",
+    "summary": "llama3.1:8b",
+    "vision": "llava:latest"
+  },
+  "hardware_profile": {
+    "ram_gb": 31.7,
+    "ram_available_gb": 15.9,
+    "cpu_cores": 8,
+    "gpu_name": "none",
+    "gpu_vram_gb": 0.0,
+    "os": "Windows"
+  },
+  "hardware_recommended": {
+    "general": "mixtral:latest",
+    "coding": "codellama:latest"
+  },
+  "openai_api_key": "",
+  "anthropic_api_key": "",
+  "wake_sensitivity": "medium",
+  "run_greeting": true,
+  "show_tasks_startup": true,
+  "trading": {
+    "symbols": "",
+    "risk": "moderate",
+    "broker_api_key": ""
+  },
+  "coding": {
+    "aider_api_key": "",
+    "default_repo": "",
+    "optimizely_path": "C:\\Users\\AsviniRajanSS\\Downloads\\insite-commerce-cloud-master\\insite-commerce-cloud-master"
+  },
+  "github": {
+    "token": "",
+    "remote_url": ""
+  },
+  "auto_commit_upgrades": false
+}

@@ -52,7 +52,7 @@ except ImportError:
     _jarvis_log = None
 
 # ── project imports ───────────────────────────────────────────────────────────
-from ui import JarvisUI
+from jarvis_ui import JarvisUI
 from memory.memory_manager import load_memory, update_memory, format_memory_for_prompt
 from llm_client import chat_with_tools, get_active_model, get_settings, warm_up_model, unified_chat
 from db.database import (
@@ -114,19 +114,40 @@ def _load_system_prompt() -> str:
     if parts:
         return "\n\n".join(parts)
     return (
-        "You are Mark-XXXIX, a personal AI assistant for SS. "
+        "You are Jarvis, a personal AI assistant for SS. "
         "Be concise and direct. Use tools when needed. Ask before external actions."
     )
 
 
 def _is_yes(text: str) -> bool:
+    """Strict yes — word tokens only (avoids 'ok' inside longer commands)."""
     t = text.lower().strip()
-    return any(w in t for w in ("yes", "yeah", "yep", "sure", "ok", "okay", "please", "do it", "go ahead"))
+    tokens = set(re.sub(r"[^\w\s]", " ", t).split())
+    if tokens & {"yes", "yeah", "yep", "sure", "ok", "okay", "please", "y"}:
+        return True
+    return any(p in t for p in ("do it", "go ahead", "go on"))
 
 
 def _is_no(text: str) -> bool:
     t = text.lower().strip()
-    return any(w in t for w in ("no", "nope", "don't", "skip", "not now", "later"))
+    tokens = set(re.sub(r"[^\w\s]", " ", t).split())
+    if tokens & {"no", "nope", "skip", "later", "nah"}:
+        return True
+    return any(p in t for p in ("don't", "not now", "skip it"))
+
+
+def _is_real_command(text: str) -> bool:
+    """User asked a real question/command — exit greeting wizard."""
+    t = text.lower().strip()
+    if len(t) < 4:
+        return False
+    keywords = (
+        "what", "how", "why", "when", "where", "who", "tell", "show", "list",
+        "task", "tasks", "pending", "weather", "watchlist", "groww", "open",
+        "pull", "debug", "code", "fix", "create", "build", "search", "news",
+        "panunga", "sollu", "enna", "veppu", "vannila", "tamil",
+    )
+    return any(k in t for k in keywords)
 
 
 def _is_skip_all(text: str) -> bool:
@@ -134,12 +155,266 @@ def _is_skip_all(text: str) -> bool:
     return any(w in t for w in ("skip all", "just start", "skip everything", "start listening"))
 
 
+def _is_stop_command(text: str) -> bool:
+    """Only explicit stop/cancel — do not interrupt on background noise."""
+    t = re.sub(r"[^\w\s']", " ", (text or "").lower()).strip()
+    if not t:
+        return False
+    phrases = (
+        "jarvis stop", "stop jarvis", "okay jarvis stop", "ok jarvis stop",
+        "please stop", "stop please", "stop listening", "cancel jarvis",
+        "jarvis cancel", "just stop",
+    )
+    if any(p in t for p in phrases):
+        return True
+    words = t.split()
+    return words == ["stop"] or (len(words) <= 3 and words[-1] == "stop")
+
+
+def _tts_sanitize(text: str, max_len: int = 600) -> str:
+    """Prepare text for speech — remove markdown, keep real content."""
+    if not text or not text.strip():
+        return ""
+    text = re.sub(r"```[\s\S]*?```", "code block omitted", text)
+    text = re.sub(r"`([^`]+)`", lambda m: m.group(1).strip(), text)
+    lines = []
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("[") and "]" in s[:60] and len(s) < 80:
+            continue
+        if s.upper().startswith("ASSISTANT]") or s.upper().startswith("[CURRENT"):
+            continue
+        if s:
+            lines.append(s)
+    clean = " ".join(lines).strip()
+    if len(clean) > max_len:
+        parts = re.split(r"(?<=[.!?])\s+", clean)
+        result = ""
+        for p in parts:
+            if len(result) + len(p) + 1 <= max_len:
+                result = (result + " " + p).strip()
+            else:
+                break
+        clean = result or clean[:max_len]
+    return clean
+
+
 def _speech_enabled() -> bool:
+    """Always returns True unless EXPLICITLY set to False in settings."""
     try:
         from llm_client import get_settings
-        return bool(get_settings().get("speech_enabled", True))
+        val = get_settings().get("speech_enabled", True)
+        if val is None or val == "":
+            return True
+        return bool(val)
     except Exception:
         return True
+
+
+def _try_fast_command(text: str, jarvis: "JarvisLocal") -> bool:
+    """Local commands without LLM — tasks, watchlist, weather refresh."""
+    import re
+    t = text.strip()
+    low = t.lower()
+    ui = jarvis.ui
+
+    m = re.match(r"^(?:jarvis[,]?\s*)?add\s+task[:\s]+(.+)$", t, re.I)
+    if m:
+        title = m.group(1).strip()
+        save_task(title, "", "personal")
+        ui.write_log(f"SYS: Task added — {title}")
+        jarvis._speak(f"Added task: {title}")
+        if hasattr(ui._win, "_refresh_side"):
+            ui._win._refresh_side()
+        return True
+
+    add_pat = re.compile(
+        r"add\s+(.+?)\s+(?:to|in|into)\s+(?:my\s+)?watchlist",
+        re.IGNORECASE,
+    )
+    m = add_pat.search(t)
+    if m:
+        raw_sym = m.group(1).strip()
+        from actions.market_tracker import run as mt_run, _normalise_symbol
+        result = mt_run({"action": "add", "symbol": raw_sym}, player=ui)
+        ui.write_log(f"SYS: {result}")
+        jarvis._speak(f"Added {_normalise_symbol(raw_sym)} to your watchlist.")
+        return True
+
+    rem_pat = re.compile(
+        r"remove\s+(.+?)\s+(?:from|off)\s+(?:my\s+)?watchlist",
+        re.IGNORECASE,
+    )
+    m = rem_pat.search(t)
+    if m:
+        raw_sym = m.group(1).strip()
+        from actions.market_tracker import run as mt_run, _normalise_symbol
+        result = mt_run({"action": "remove", "symbol": raw_sym}, player=ui)
+        ui.write_log(f"SYS: {result}")
+        jarvis._speak(f"Removed {_normalise_symbol(raw_sym)} from watchlist.")
+        return True
+
+    if re.search(r"show|list|display|what.s on", low) and "watchlist" in low:
+        from actions.market_tracker import run as mt_run
+        result = mt_run({"action": "show_watchlist"}, player=ui)
+        ui.write_log(f"Jarvis: {result}")
+        jarvis._speak(result[:200])
+        return True
+
+    price_pat = re.compile(
+        r"(?:price|rate|value|how much)\s+(?:of|is|for)?\s+(.+?)(?:\s+stock|\s+share|\?|$)",
+        re.IGNORECASE,
+    )
+    m = price_pat.search(t)
+    if not m:
+        price_pat2 = re.compile(r"(.+?)\s+(?:stock\s+)?price", re.IGNORECASE)
+        m = price_pat2.search(t)
+    if m and any(kw in low for kw in ("price", "rate", "trading at", "worth")):
+        raw_sym = m.group(1).strip()
+        from actions.market_tracker import run as mt_run
+        result = mt_run({"action": "get_price", "symbol": raw_sym}, player=ui)
+        ui.write_log(f"Jarvis: {result}")
+        jarvis._speak(result[:200])
+        return True
+
+    if "watchlist" in low or re.search(r"\b(groww|grow)\b", low):
+        from actions.market_tracker import run as mt_run
+        result = mt_run({"action": "show_watchlist"}, player=ui)
+        ui.write_log(f"Jarvis: {result}")
+        jarvis._speak(result[:200])
+        return True
+
+    if "refresh dashboard" in low or "refresh weather" in low:
+        if hasattr(ui._win, "_refresh_side"):
+            ui._win._refresh_side()
+        ui.write_log("SYS: Dashboard refreshed.")
+        jarvis._speak("Dashboard updated.")
+        return True
+
+    if low in ("show window", "open window", "show jarvis"):
+        ui.show()
+        return True
+
+    if re.search(r"\b(tamil|tanglish)\b", low) and re.search(
+        r"\b(speak|understand|language|tamil|tanglish|pesu)\b", low
+    ):
+        msg = (
+            "Yes SS — I understand Tamil and Tanglish. "
+            "You can speak Tamil; I'll reply in Tanglish unless you want pure Tamil."
+        )
+        ui.write_log(f"Jarvis: {msg}")
+        jarvis._speak(msg)
+        return True
+
+    if re.search(r"\bopen\b.*\b(chrome|browser)\b", low) and "youtube" in low:
+        try:
+            browser_control({"action": "open", "url": "https://www.youtube.com"})
+            ui.write_log("Jarvis: Opening YouTube in the browser.")
+            jarvis._speak("Opening YouTube, SS.")
+        except Exception as e:
+            ui.write_log(f"Jarvis: {e}")
+        return True
+
+    if re.search(r"\bopen\b.*\bchrome\b", low):
+        try:
+            open_app(parameters={"app_name": "Chrome"}, response=None, player=ui)
+            ui.write_log("Jarvis: Opening Chrome.")
+            jarvis._speak("Opening Chrome.")
+        except Exception as e:
+            ui.write_log(f"Jarvis: {e}")
+        return True
+
+    if re.search(r"\b(list|show|what are|tell me|recap|pending|impending)\b.*\b(task|todo)s?\b", low) or re.search(r"\b(task|todo)s?\b.*\b(list|show|pending)\b", low):
+        tasks = get_active_tasks()
+        seen: set[str] = set()
+        titles = []
+        for t in tasks:
+            title = (t.get("title") or "").strip()
+            if title and title.lower() not in seen:
+                seen.add(title.lower())
+                titles.append(title)
+        if not titles:
+            msg = "You have no active tasks."
+        else:
+            msg = f"You have {len(titles)} active tasks: " + "; ".join(titles[:8])
+        ui.write_log(f"Jarvis: {msg}")
+        jarvis._speak(msg[:220])
+        if hasattr(ui._win, "_refresh_side"):
+            ui._win._refresh_side()
+        return True
+
+    if re.search(r"\b(weather|temperature|forecast)\b", low) or ("pull" in low and "weather" in low):
+        try:
+            from llm_client import get_settings
+            city = get_settings().get("weather_city") or "Chennai"
+            from services.weather_service import format_weather_line
+            line = format_weather_line(city)
+            ui.write_log(f"Jarvis: {line}")
+            jarvis._speak(line[:200])
+            if hasattr(ui._win, "_refresh_side"):
+                ui._win._refresh_side()
+        except Exception as e:
+            ui.write_log(f"Jarvis: Weather unavailable — {e}")
+            jarvis._speak("Weather service is unavailable right now.")
+        return True
+
+    # YouTube play — fast path (no LLM)
+    m = re.search(r"play\s+(.+?)\s+(?:on|in|via)\s+youtube", low)
+    if not m:
+        m = re.search(r"(?:youtube|yt)\s+(?:play|open|search)\s+(.+)", low)
+    if not m and "youtube" in low and any(w in low for w in ("play", "song", "music", "video")):
+        for trigger in ("play ", "youtube "):
+            idx = low.find(trigger)
+            if idx >= 0:
+                query = t[idx + len(trigger):].strip()
+                if query:
+                    class _M:
+                        @staticmethod
+                        def group(n):
+                            return query
+                    m = _M()
+                    break
+
+    if m:
+        try:
+            query = m.group(1) if hasattr(m, "group") else str(m)
+            from actions.youtube_video import youtube_video
+            youtube_video({"action": "play", "query": str(query)}, player=ui)
+            ui.write_log(f"Jarvis: Playing '{query}' on YouTube.")
+            jarvis._speak(f"Playing {query} on YouTube.")
+        except Exception as e:
+            ui.write_log(f"Jarvis: YouTube error — {e}")
+            import webbrowser
+            from urllib.parse import quote_plus
+            webbrowser.open(f"https://www.youtube.com/results?search_query={quote_plus(str(query))}")
+        return True
+
+    if re.search(r"open\s+(?:vs\s?code|visual\s+studio\s+code|vs)\b", low) or "open vs" in low:
+        try:
+            from llm_client import get_settings
+            occ_path = (get_settings().get("coding") or {}).get("optimizely_path") or "."
+            from actions.system_access import open_vs_code_with_folder
+            result = open_vs_code_with_folder(occ_path)
+            ui.write_log(f"Jarvis: {result}")
+            jarvis._speak(result)
+        except Exception as e:
+            ui.write_log(f"Jarvis: {e}")
+        return True
+
+    # Open URL / website
+    m2 = re.search(r"open\s+(https?://\S+|[\w.-]+\.\w{2,})", low)
+    if m2:
+        url = m2.group(1)
+        try:
+            import webbrowser
+            webbrowser.open(url if url.startswith("http") else "https://" + url)
+            ui.write_log(f"Jarvis: Opening {url}")
+            jarvis._speak(f"Opening {url}")
+        except Exception as e:
+            ui.write_log(f"Jarvis: {e}")
+        return True
+
+    return False
 
 
 def _parse_voice_command(text: str) -> str | None:
@@ -152,7 +427,7 @@ def _parse_voice_command(text: str) -> str | None:
         return None
     try:
         from llm_client import get_settings
-        if not get_settings().get("require_jarvis_prefix", True):
+        if not get_settings().get("require_jarvis_prefix", False):
             return raw
     except Exception:
         return raw
@@ -231,7 +506,7 @@ TOOL_DECLARATIONS = [
         "parameters": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["add", "show_watchlist", "open_broker", "get_price"]},
+                "action": {"type": "string", "enum": ["add", "remove", "show_watchlist", "open_broker", "get_price"]},
                 "symbol": {"type": "string"},
                 "broker": {"type": "string"},
                 "label":  {"type": "string"}
@@ -438,6 +713,78 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "coding_bridge",
+        "description": (
+            "Local code edit/debug via Ollama or Aider CLI. "
+            "Use for fixing bugs, patching files, and quick refactors in the repo."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "File to edit"},
+                "instruction": {"type": "string", "description": "What to change or fix"},
+                "use_aider": {"type": "boolean", "description": "Use Aider if installed"},
+            },
+            "required": ["file_path", "instruction"],
+        },
+    },
+    {
+        "name": "coding_agent",
+        "description": (
+            "Unified coding agent. Reads the screen for errors, finds the file, "
+            "and fixes it using Aider or Ollama. Use for: fix this error, help me debug."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "instruction": {"type": "string", "description": "What to fix"},
+                "file_path": {"type": "string", "description": "File to edit (optional)"},
+                "use_screen": {"type": "boolean", "description": "Capture screen (default true)"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "optimizely_agent",
+        "description": (
+            "Optimizely Configured Commerce expert. OCC/.NET errors, handlers, ElasticSearch, widgets."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "error": {"type": "string", "description": "Error message"},
+                "ticket_id": {"type": "string", "description": "JIRA ticket ID"},
+                "open_docs": {"type": "boolean", "description": "Open Optimizely docs"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "trading_briefing",
+        "description": "Daily market news, watchlist prices, and AI trade recommendations.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "force": {"type": "boolean", "description": "Re-run if already briefed today"},
+            },
+        },
+    },
+    {
+        "name": "self_upgrade",
+        "description": (
+            "Apply a self-upgrade: creates a git branch, writes changes, commits safely."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string", "description": "What the upgrade does"},
+                "search_github": {"type": "boolean", "description": "Search GitHub for ideas"},
+                "github_query": {"type": "string", "description": "GitHub search query"},
+            },
+            "required": ["description"],
+        },
+    },
+    {
         "name": "dev_agent",
         "description": "Builds complete multi-file projects from scratch.",
         "parameters": {
@@ -465,6 +812,25 @@ TOOL_DECLARATIONS = [
             },
             "required": ["goal"]
         }
+    },
+    {
+        "name": "system_access",
+        "description": (
+            "Full system access: open ANY application (VS Code, Chrome, Outlook, Teams, etc), "
+            "open folders in Explorer, run shell commands, read and write files, list directories."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "description": "open_app | open_folder | open_vscode | run | read | write | list"},
+                "app_name": {"type": "string", "description": "Application name (VS Code, Chrome, Teams)"},
+                "path": {"type": "string", "description": "File or folder path"},
+                "folder": {"type": "string", "description": "Working directory"},
+                "command": {"type": "string", "description": "Shell command to run"},
+                "content": {"type": "string", "description": "Content to write to file"},
+            },
+            "required": ["action"],
+        },
     },
     {
         "name": "computer_control",
@@ -624,20 +990,31 @@ class _TTSEngine:
                 with self._lock:
                     if not self._queue:
                         break
-                    text = self._queue.pop(0)
+                    item = self._queue.pop(0)
+                if isinstance(item, tuple):
+                    text, done_evt = item
+                else:
+                    text, done_evt = item, None
                 try:
                     self._engine.say(text)
                     self._engine.runAndWait()
+                    print(f"[TTS] ✅ Spoke: {text[:60]}")
                 except Exception as e:
                     print(f"[TTS] Speak error: {e}")
+                finally:
+                    if done_evt:
+                        done_evt.set()
 
-    def speak(self, text: str):
+    def speak(self, text: str, wait: bool = False):
         if not _TTS_OK or not self._ready:
-            print(f"[JARVIS] (no TTS) {text}")
+            print(f"[JARVIS] (no TTS) {text[:120]}")
             return
+        done = threading.Event() if wait else None
         with self._lock:
-            self._queue.append(text)
+            self._queue.append((text, done))
         self._event.set()
+        if wait and done:
+            done.wait(timeout=300)
 
     def stop(self):
         if self._engine:
@@ -669,6 +1046,8 @@ class _VoiceRecorder:
         self._thread: threading.Thread | None = None
 
     def start(self):
+        if self._running:
+            return
         self._running = True
         self._thread  = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -778,26 +1157,50 @@ def _get_whisper():
     with _whisper_lock:
         if _whisper_model is None:
             try:
-                print("[JARVIS] Loading Whisper model (base.en)…")
-                _whisper_model = _WhisperModel("base.en", device="cpu", compute_type="int8")
+                from llm_client import get_settings
+                whisper_name = get_settings().get("whisper_model") or "base"
+                print(f"[JARVIS] Loading Whisper model ({whisper_name})…")
+                _whisper_model = _WhisperModel(whisper_name, device="cpu", compute_type="int8")
                 print("[JARVIS] Whisper ready.")
             except Exception as e:
                 print(f"[JARVIS] Whisper load failed: {e}")
         return _whisper_model
 
 
-def _transcribe(audio_np: np.ndarray) -> str:
+def _transcribe_with_confidence(audio_np: np.ndarray) -> tuple[str, float]:
+    """Returns (text, avg_confidence). Confidence 0.0–1.0."""
     model = _get_whisper()
     if model is None:
-        return ""
+        return "", 0.0
     try:
-        # faster-whisper expects float32 normalised to [-1, 1]
+        from core.language import get_stt_language
+        lang = get_stt_language()
         audio_f = audio_np.astype(np.float32) / 32768.0
-        segments, _ = model.transcribe(audio_f, language="en", beam_size=1)
-        return " ".join(seg.text for seg in segments).strip()
+        kwargs = {"beam_size": 3, "best_of": 3, "word_timestamps": True}
+        if lang:
+            kwargs["language"] = lang
+        segments, _ = model.transcribe(audio_f, **kwargs)
+        seg_list = list(segments)
+        text = " ".join(seg.text for seg in seg_list).strip()
+        if not seg_list:
+            return text, 0.0
+        confs = []
+        for seg in seg_list:
+            if seg.words:
+                confs.append(sum(w.probability for w in seg.words) / len(seg.words))
+            elif getattr(seg, "avg_logprob", None) is not None:
+                confs.append(min(1.0, max(0.0, 1.0 + seg.avg_logprob / 5)))
+            else:
+                confs.append(0.7)
+        return text, sum(confs) / len(confs)
     except Exception as e:
         print(f"[JARVIS] Transcription error: {e}")
-        return ""
+        return "", 0.0
+
+
+def _transcribe(audio_np: np.ndarray) -> str:
+    text, _ = _transcribe_with_confidence(audio_np)
+    return text
 
 
 # ── Main assistant class ──────────────────────────────────────────────────────
@@ -816,7 +1219,20 @@ class JarvisLocal:
         self._last_interaction = time.time()
         self._idle_timer_running = False
         self._greeting_step = 0  # 0 = normal; 2–5 = permission gates
+        self._idle_prompt_step = 0  # 0 = off; 1 = waiting yes/no to minimize
         self._skip_prefix_once = False  # after wake word, next utterance skips prefix
+        self._processing = False
+        self._process_lock = threading.Lock()
+        self._pending_confirmation: str | None = None
+
+        # Mini HUD companion window
+        try:
+            from ui.mini_hud import get_mini_hud
+            self._mini_hud = get_mini_hud()
+            self._mini_hud.send_command.connect(self._on_mini_hud_command)
+        except Exception as e:
+            print(f"[MiniHUD] Init failed: {e}")
+            self._mini_hud = None
 
         # Task 13: TTS Queue
         self._tts_queue = queue.Queue()
@@ -835,38 +1251,105 @@ class JarvisLocal:
         self._last_interaction = time.time()
         self._wake_listener.stop()
         self._recorder.start()
+        if self._mini_hud:
+            self._mini_hud.hide()
 
     def _on_window_hidden(self):
         """Window hidden: voice recorder off, wake word on."""
         self._recorder.stop()
         if _SR_OK:
             self._wake_listener.start()
+        if self._mini_hud:
+            self._mini_hud.show()
+            self._mini_hud.raise_()
+
+    def _on_mini_hud_command(self, cmd: str):
+        if cmd == "__restore_main__":
+            self.ui.show()
+            if self._mini_hud:
+                self._mini_hud.hide()
+        else:
+            self._on_text_command(cmd)
+
+    def _handle_pending_confirmation(self, text: str) -> bool:
+        if not self._pending_confirmation:
+            return False
+        if _is_yes(text):
+            confirmed = self._pending_confirmation
+            self._pending_confirmation = None
+            threading.Thread(target=self._process, args=(confirmed,), daemon=True).start()
+            return True
+        if _is_no(text):
+            self._pending_confirmation = None
+            self._speak("Okay, say it again clearly.")
+            return True
+        return False
 
     def _tts_worker(self):
-        """Dedicated thread for speaking from a queue. Mic mute does NOT block TTS."""
+        """Dedicated TTS thread. Mic mute does NOT affect TTS."""
         while True:
             text = self._tts_queue.get()
-            if not _speech_enabled():
-                self._tts_queue.task_done()
-                continue
-                
-            self.ui.set_state("SPEAKING")
-            self._recorder.set_jarvis_speaking(True)
             try:
-                _tts.speak(text)
-            except Exception as e:
-                print(f"[JARVIS] Primary TTS failed, using fallback: {e}")
+                if not _speech_enabled():
+                    print(f"[TTS] SKIPPED (speech_enabled=False): {text[:60]}")
+                    self._tts_queue.task_done()
+                    continue
+
+                self.ui.set_state("SPEAKING")
+                self._recorder.set_jarvis_speaking(True)
+                spoken = _tts_sanitize(text)
+                if not spoken:
+                    print(f"[TTS] SKIPPED (empty after sanitize): {repr(text[:60])}")
+                    self._recorder.set_jarvis_speaking(False)
+                    self.ui.set_state("LISTENING")
+                    self._tts_queue.task_done()
+                    continue
+
+                print(f"[TTS] Speaking: {spoken[:80]}")
+                spoke = False
                 try:
-                    import pyttsx3
-                    engine = pyttsx3.init()
-                    engine.say(text)
-                    engine.runAndWait()
-                except Exception as e2:
-                    print(f"[JARVIS] Fallback TTS also failed: {e2}")
-            
-            self._recorder.set_jarvis_speaking(False)
-            self.ui.set_state("LISTENING")
-            self._tts_queue.task_done()
+                    _tts.speak(spoken, wait=True)
+                    spoke = True
+                except Exception as e1:
+                    print(f"[TTS] Primary failed: {e1}")
+
+                if not spoke:
+                    try:
+                        import pyttsx3
+                        engine = pyttsx3.init()
+                        engine.setProperty("rate", 175)
+                        engine.say(spoken)
+                        engine.runAndWait()
+                        engine.stop()
+                        spoke = True
+                    except Exception as e2:
+                        print(f"[TTS] Fallback pyttsx3 failed: {e2}")
+
+                if not spoke:
+                    try:
+                        import subprocess
+                        safe = spoken[:200].replace('"', " ").replace("\n", " ")
+                        script = (
+                            "Add-Type -AssemblyName System.Speech; "
+                            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+                            f'$s.Speak("{safe}")'
+                        )
+                        subprocess.Popen(
+                            ["powershell", "-WindowStyle", "Hidden", "-Command", script],
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        )
+                        spoke = True
+                        print("[TTS] Used PowerShell SAPI fallback")
+                    except Exception as e3:
+                        print(f"[TTS] All TTS methods failed: {e3}")
+
+            except Exception as outer:
+                print(f"[TTS] Worker outer error: {outer}")
+            finally:
+                self._recorder.set_jarvis_speaking(False)
+                time.sleep(0.25)
+                self.ui.set_state("LISTENING")
+                self._tts_queue.task_done()
 
     def _on_mute_changed(self, muted: bool):
         """Mic mute only — stops listener, not TTS or background agents."""
@@ -896,6 +1379,11 @@ class JarvisLocal:
         if _jarvis_log:
             _jarvis_log.info("JarvisLocal.start()")
         threading.Thread(target=self._run_diagnostics_background, daemon=True).start()
+        try:
+            from core.hardware_profile import apply_hardware_model_async
+            apply_hardware_model_async(on_log=lambda m: self.ui.write_log(f"SYS: {m}"))
+        except Exception as e:
+            print(f"[Hardware] {e}")
         warm_up_model()
         
         model_info = get_active_model()
@@ -914,12 +1402,23 @@ class JarvisLocal:
         else:
             self.ui.write_log("SYS: Ready.")
 
-        if settings.get("first_launch_complete", False) and settings.get("start_minimized", True):
-            self.ui.hide()
-        else:
+        # Keep window visible by default so dashboard + mic stay usable
+        if not settings.get("first_launch_complete"):
             settings["first_launch_complete"] = True
             from llm_client import save_settings
             save_settings(settings)
+
+        self.ui.show()
+        self.ui._jarvis_ref = self
+        if hasattr(self.ui._win, "_dash"):
+            self.ui._win._dash.show()
+            self.ui._win._refresh_side()
+
+        if settings.get("start_minimized", False):
+            self.ui.write_log("SYS: Starting in tray — use tray menu Show to open.")
+            threading.Timer(3.0, self.ui.hide).start()
+        else:
+            self.ui.write_log("SYS: Microphone active. Say Jarvis or type commands.")
 
     def _run_greeting(self):
         """Step 1 greeting, then permission-gated steps 2–5."""
@@ -933,14 +1432,21 @@ class JarvisLocal:
             period = "evening"
 
         tasks = get_active_tasks()
+        seen: set[str] = set()
+        unique_tasks = []
+        for t in tasks:
+            title = (t.get("title") or "").strip()
+            if title and title.lower() not in seen:
+                seen.add(title.lower())
+                unique_tasks.append(t)
         model_name = get_active_model()["model"]
         line = (
             f"Good {period}, SS. Today is {now.strftime('%A, %B %d')}. "
             f"The time is {now.strftime('%I:%M %p')}. "
             f"I'm running on {model_name}."
         )
-        if tasks:
-            line += f" You have {len(tasks)} active tasks from your last session."
+        if unique_tasks:
+            line += f" You have {len(unique_tasks)} active task{'s' if len(unique_tasks) != 1 else ''} from your last session."
         line += " What would you like to do?"
 
         self.ui.write_log(f"Jarvis: {line}")
@@ -949,8 +1455,21 @@ class JarvisLocal:
         if hasattr(self.ui._win, "_refresh_side"):
             self.ui._win._refresh_side()
 
+        try:
+            from actions.trading_agent import is_first_wake_today, trading_briefing
+            if is_first_wake_today():
+                threading.Thread(
+                    target=trading_briefing,
+                    kwargs={"parameters": {}, "player": self.ui, "speak": self._speak},
+                    daemon=True,
+                ).start()
+        except Exception as e:
+            print(f"[Trading] Briefing error: {e}")
+
         from llm_client import get_settings
         if not get_settings().get("run_greeting", True):
+            return
+        if not get_settings().get("run_greeting_steps", False):
             return
 
         self._greeting_step = 2
@@ -965,29 +1484,35 @@ class JarvisLocal:
         """Handle yes/no during startup permission sequence. Returns True if consumed."""
         if self._greeting_step == 0:
             return False
-        if _is_skip_all(text):
+        if _is_skip_all(text) or _is_real_command(text):
             self._greeting_step = 0
-            self._speak("Understood. I'm listening, SS.")
+            if _is_skip_all(text):
+                self._speak("Understood. I'm listening, SS.")
             if hasattr(self.ui._win, "_refresh_side"):
                 self.ui._win._refresh_side()
-            return True
+            return _is_skip_all(text)
 
         step = self._greeting_step
         yes, no = _is_yes(text), _is_no(text)
+        if not yes and not no:
+            return False
 
         if step == 2:
             if yes:
                 try:
                     from llm_client import get_settings
-                    city = get_settings().get("weather_city") or "current location"
-                    from actions.weather_report import weather_action
-                    w = weather_action({"city": city})
-                    self.ui.write_log(f"Jarvis: {w[:400]}")
+                    city = get_settings().get("weather_city") or "Chennai"
+                    from services.weather_service import format_weather_line
+                    w = format_weather_line(city)
+                    self.ui.write_log(f"Jarvis: {w}")
                     self._speak(w[:200])
                 except Exception as e:
                     self.ui.write_log(f"Jarvis: Could not fetch weather — {e}")
-            self._greeting_step = 3
-            self._greeting_ask("Want me to open Groww and check your watchlist?")
+            self._greeting_step = 3 if not no else 0
+            if self._greeting_step == 3:
+                self._greeting_ask("Want me to open Groww and check your watchlist?")
+            else:
+                self._speak("I'm listening, SS.")
             return True
 
         if step == 3:
@@ -1001,8 +1526,11 @@ class JarvisLocal:
                     self._speak(str(r)[:180])
                 except Exception as e:
                     self.ui.write_log(f"Jarvis: {e}")
-            self._greeting_step = 4
-            self._greeting_ask("Should I get a quick world news summary?")
+            self._greeting_step = 4 if not no else 0
+            if self._greeting_step == 4:
+                self._greeting_ask("Should I get a quick world news summary?")
+            else:
+                self._speak("I'm listening, SS.")
             return True
 
         if step == 4:
@@ -1014,17 +1542,27 @@ class JarvisLocal:
                     self._speak(summary[:200])
                 except Exception as e:
                     self.ui.write_log(f"Jarvis: News unavailable — {e}")
-            self._greeting_step = 5
-            self._greeting_ask("Want me to recap your pending tasks?")
+            self._greeting_step = 5 if not no else 0
+            if self._greeting_step == 5:
+                self._greeting_ask("Want me to recap your pending tasks?")
+            else:
+                self._speak("I'm listening, SS.")
             return True
 
         if step == 5:
             if yes:
                 tasks = get_active_tasks()
-                if tasks:
-                    lines = "; ".join(t["title"] for t in tasks[:8])
+                seen: set[str] = set()
+                titles = []
+                for t in tasks:
+                    title = (t.get("title") or "").strip()
+                    if title and title.lower() not in seen:
+                        seen.add(title.lower())
+                        titles.append(title)
+                if titles:
+                    lines = "; ".join(titles[:8])
                     self.ui.write_log(f"Jarvis: Active tasks: {lines}")
-                    self._speak(f"You have {len(tasks)} tasks. {lines[:200]}")
+                    self._speak(f"You have {len(titles)} tasks. {lines[:200]}")
                 else:
                     self._speak("You have no active tasks.")
             elif no and hasattr(self.ui._win, "_refresh_side"):
@@ -1069,38 +1607,90 @@ class JarvisLocal:
         self.ui.set_state("LISTENING")
 
     def _start_idle_timer(self):
-        if self._idle_timer_running: return
+        if self._idle_timer_running:
+            return
         self._idle_timer_running = True
+
         def _timer():
             while True:
                 time.sleep(5)
-                if time.time() - self._last_interaction > 90:
-                    if self.ui._win.isVisible() and self.ui.state == "LISTENING":
-                        print("[JARVIS] 💤 Idle for 90s, minimizing...")
-                        self._speak("Going quiet. Say Wake up Jarvis when you need me.")
-                        self.ui.hide()
+                idle_sec = time.time() - self._last_interaction
+                if idle_sec < 300:
+                    continue
+                if not self.ui._win.isVisible() or self.ui.state != "LISTENING":
+                    continue
+                if self._processing or self._idle_prompt_step:
+                    continue
+                print("[JARVIS] 💤 Idle — asking permission to minimize…")
+                self._idle_prompt_step = 1
+                self.ui.write_log("Jarvis: SS, should I go idle and minimize? Say yes or no.")
+                self._speak("SS, should I go idle and minimize? Say yes or no.")
+
         threading.Thread(target=_timer, daemon=True).start()
+
+    def _handle_idle_reply(self, text: str) -> bool:
+        if self._idle_prompt_step != 1:
+            return False
+        yes, no = _is_yes(text), _is_no(text)
+        if not yes and not no:
+            return False
+        self._idle_prompt_step = 0
+        self._last_interaction = time.time()
+        if yes:
+            self._speak("Going quiet. Say wake up Jarvis when you need me.")
+            threading.Timer(1.2, self.ui.hide).start()
+        else:
+            self._speak("Staying on, SS.")
+        return True
+
+    def _do_stop(self):
+        """Cancel current work — only path that interrupts Jarvis."""
+        print("[JARVIS] ⏹ Stop requested")
+        self.interrupt_event.set()
+        _tts.stop()
+        with self._process_lock:
+            self._processing = False
+        while not self._tts_queue.empty():
+            try:
+                self._tts_queue.get_nowait()
+                self._tts_queue.task_done()
+            except Exception:
+                break
+        self.ui.write_log("Jarvis: Stopped.")
+        self._speak("Stopped, SS.")
+        self.ui.set_state("LISTENING")
 
     # ── voice path ───────────────────────────────────────────────────
     def _on_raw_audio(self, audio_np: np.ndarray):
         """Called from recorder thread when an utterance is captured."""
         if self.ui.muted:
             return
-        
-        self._last_interaction = time.time()
-        
-        # TASK 4 Fix: Handle interruption
-        if self.ui.state in ("THINKING", "SPEAKING", "PROCESSING"):
-            print("[JARVIS] ✋ Interrupted by voice!")
-            self.interrupt_event.set()
-            _tts.stop()
-            self.ui.write_log("Jarvis: [cancelled — interrupted]")
-        
-        self.ui.set_state("THINKING")
-        text = _transcribe(audio_np)
-        if not text or len(text.strip()) < 2:
-            self.ui.set_state("LISTENING")
+
+        text, confidence = _transcribe_with_confidence(audio_np)
+        if not text or len(text.strip()) < 3:
             return
+
+        if _is_stop_command(text):
+            self._last_interaction = time.time()
+            self._do_stop()
+            return
+
+        if self._handle_pending_confirmation(text):
+            return
+
+        if self._processing or self.ui.state in ("SPEAKING", "THINKING", "PROCESSING"):
+            return
+
+        LOW_CONFIDENCE = 0.55
+        if confidence < LOW_CONFIDENCE and not _is_stop_command(text):
+            self.ui.write_log(f"[?] Did you say: \"{text}\" ? (say yes/no or repeat)")
+            self._speak(f"Did you say: {text}?")
+            self._pending_confirmation = text
+            return
+
+        self._pending_confirmation = None
+        self._last_interaction = time.time()
+        self.ui.set_state("THINKING")
         if not self._skip_prefix_once:
             cmd = _parse_voice_command(text)
             if cmd is None:
@@ -1115,6 +1705,12 @@ class JarvisLocal:
             return
 
         self.ui.write_log(f"You: {text}")
+        if self._handle_idle_reply(text):
+            self.ui.set_state("LISTENING")
+            return
+        if _try_fast_command(text, self):
+            self.ui.set_state("LISTENING")
+            return
         if self._handle_greeting_reply(text):
             self.ui.set_state("LISTENING")
             return
@@ -1123,23 +1719,39 @@ class JarvisLocal:
     # ── text path (from input box) ────────────────────────────────────
     def _on_text_command(self, text: str):
         self._last_interaction = time.time()
+        if _is_stop_command(text):
+            self._do_stop()
+            return
+        if self._handle_pending_confirmation(text):
+            return
+        if self._handle_idle_reply(text):
+            return
+        if _try_fast_command(text, self):
+            return
         if self._handle_greeting_reply(text):
             return
-        # TASK 4 Fix: Handle interruption
-        if self.ui.state in ("THINKING", "SPEAKING", "PROCESSING"):
-            print("[JARVIS] ✋ Interrupted by text!")
-            self.interrupt_event.set()
-            _tts.stop()
-            self.ui.write_log("Jarvis: [cancelled — interrupted]")
-            
+        if self._processing:
+            self.ui.write_log("SYS: Still working — say 'Jarvis stop' to cancel.")
+            return
         self.ui.set_state("THINKING")
         threading.Thread(target=self._process, args=(text,), daemon=True).start()
 
     # ── core processing ───────────────────────────────────────────────
     def _process(self, user_text: str):
         """Send user_text to Ollama, handle tool calls, speak reply."""
+        with self._process_lock:
+            if self._processing:
+                self.ui.write_log("SYS: Still working — say 'Jarvis stop' to cancel.")
+                return
+            self._processing = True
         self.interrupt_event.clear()
+        if _try_fast_command(user_text, self):
+            self.ui.set_state("LISTENING")
+            with self._process_lock:
+                self._processing = False
+            return
         try:
+            self.ui.set_state("PROCESSING")
             log_conversation("user", user_text)
             system_prompt = self._build_system_prompt(user_text)
 
@@ -1165,7 +1777,8 @@ class JarvisLocal:
             if hasattr(resp, "iter_lines"): # Streaming response
                 for line in resp.iter_lines():
                     if self.interrupt_event.is_set():
-                        print("[JARVIS] ✋ Stream interrupted!")
+                        print("[JARVIS] ⏹ Stream stopped")
+                        self.ui.write_log("Jarvis: Stopped.")
                         return
                     
                     if not line: continue
@@ -1269,11 +1882,18 @@ class JarvisLocal:
                 hint = "Ollama timed out. Use a smaller model or wait for warm-up to finish."
             self.ui.write_log(f"SYS: {hint}")
             self._speak(f"SS, I hit an error. {hint}")
+        finally:
+            with self._process_lock:
+                self._processing = False
+            if self.ui.state in ("PROCESSING", "THINKING"):
+                self.ui.set_state("LISTENING")
 
     # ── TTS output ────────────────────────────────────────────────────
     def _speak(self, text: str):
-        # Task 13: Unconditional TTS with queue
-        self._tts_queue.put(text)
+        if text and _speech_enabled():
+            if self._mini_hud:
+                self._mini_hud.set_text(text[:100])
+            self._tts_queue.put(text)
 
     # ── system prompt ─────────────────────────────────────────────────
     def _build_system_prompt(self, user_text: str = "") -> str:
@@ -1287,16 +1907,75 @@ class JarvisLocal:
         if mem_str:
             parts.append(mem_str)
         parts.append(base)
+        try:
+            from core.language import prompt_instruction
+            parts.append(prompt_instruction())
+        except ImportError:
+            pass
         merged = "\n\n".join(parts)
         try:
             from agent.orchestrator import enrich_system_prompt
             merged = enrich_system_prompt(merged, user_text)
         except ImportError:
             pass
+        knowledge_dir = BASE_DIR / "knowledge" / "optimizely"
+        occ_parts = []
+        for fname in ["README.md", "PATTERNS.md"]:
+            f = knowledge_dir / fname
+            if f.exists():
+                try:
+                    occ_parts.append(f.read_text(encoding="utf-8")[:3000])
+                except Exception:
+                    pass
+
+        try:
+            from llm_client import get_settings as _gs
+            occ_path_str = (_gs().get("coding") or {}).get("optimizely_path", "")
+            if occ_path_str:
+                from pathlib import Path as _P
+                occ_root = _P(occ_path_str)
+                if occ_root.exists():
+                    cs_files = sorted(
+                        occ_root.rglob("*.cs"),
+                        key=lambda f: (
+                            0 if "Handler" in f.name else
+                            1 if "Service" in f.name else
+                            2 if "Controller" in f.name else 3
+                        ),
+                    )[:6]
+                    for cf in cs_files:
+                        try:
+                            content = cf.read_text(encoding="utf-8", errors="ignore")[:2500]
+                            occ_parts.append(f"[OCC FILE: {cf.name}]\n{content}")
+                        except Exception:
+                            pass
+                    merged += f"\n\n[OPTIMIZELY PROJECT PATH]: {occ_path_str}"
+        except Exception:
+            pass
+
+        if occ_parts:
+            merged += "\n\n[OPTIMIZELY CONTEXT]\n" + "\n\n".join(occ_parts)
+            merged += (
+                "\n\nYou are an expert in Optimizely Configured Commerce (.NET, ElasticSearch, React, IIS, SQL Server). "
+                "When asked about this project, use the actual file content above."
+            )
         return merged
 
     # ── tool executor ─────────────────────────────────────────────────
     def _execute_tool(self, name: str, args: dict) -> Any:
+        ui = self.ui
+        from ui.activity_panel import activity_start, activity_update, activity_end
+        detail = ", ".join(f"{k}={v}" for k, v in list((args or {}).items())[:3])
+        activity_start(name, detail)
+
+        try:
+            result = self._execute_tool_inner(name, args or {})
+            activity_update(str(result)[:120] if result else "done")
+            return result
+        finally:
+            activity_end()
+
+    def _execute_tool_inner(self, name: str, args: dict) -> Any:
         ui = self.ui
 
         try:
@@ -1326,10 +2005,20 @@ class JarvisLocal:
                 return "ok"
 
             elif name == "market_tracker":
-                return market_tracker(parameters=args, player=ui) or "Market data retrieved."
+                result = market_tracker(parameters=args, player=ui) or "Market data retrieved."
+                try:
+                    if hasattr(ui, "_win") and hasattr(ui._win, "_refresh_side"):
+                        ui._win._refresh_side()
+                except Exception:
+                    pass
+                return result
 
             elif name == "open_app":
                 return open_app(parameters=args, response=None, player=ui) or f"Opened {args.get('app_name')}."
+
+            elif name == "system_access":
+                from actions.system_access import system_access
+                return system_access(args, player=ui, speak=self._speak) or "Done."
 
             elif name == "weather_report":
                 return weather_action(parameters=args, player=ui) or "Weather delivered."
@@ -1360,6 +2049,26 @@ class JarvisLocal:
 
             elif name == "code_helper":
                 return code_helper(parameters=args, player=ui, speak=self._speak) or "Done."
+
+            elif name == "coding_bridge":
+                from actions.coding_bridge import coding_bridge
+                return coding_bridge(parameters=args, player=ui, speak=self._speak) or "Done."
+
+            elif name == "coding_agent":
+                from actions.coding_agent import coding_agent
+                return coding_agent(args, player=ui, speak=self._speak) or "Done."
+
+            elif name == "optimizely_agent":
+                from actions.optimizely_agent import optimizely_agent
+                return optimizely_agent(args, player=ui, speak=self._speak) or "Done."
+
+            elif name == "trading_briefing":
+                from actions.trading_agent import trading_briefing
+                return trading_briefing(args, player=ui, speak=self._speak) or "Done."
+
+            elif name == "self_upgrade":
+                from self_upgrade.upgrade_manager import self_upgrade_tool
+                return self_upgrade_tool(args, player=ui, speak=self._speak) or "Done."
 
             elif name == "dev_agent":
                 description = args.get("description", "")

@@ -42,8 +42,8 @@ BASE_DIR   = _base_dir()
 CONFIG_DIR = BASE_DIR / "config"
 API_FILE   = CONFIG_DIR / "api_keys.json"
 
-_DEFAULT_W, _DEFAULT_H = 980, 700
-_MIN_W,     _MIN_H     = 820, 580
+_DEFAULT_W, _DEFAULT_H = 1400, 850
+_MIN_W,     _MIN_H     = 900, 600
 _LEFT_W  = 148
 _DASH_W  = 280
 _RIGHT_W = 300
@@ -641,6 +641,12 @@ class LogWidget(QTextEdit):
 class DashboardPanel(QFrame):
     """Right-side dashboard — matches Mark-XXXIX HUD cards (tasks, watchlist, etc.)."""
 
+    _weather_sig = pyqtSignal(str)
+    _tasks_sig = pyqtSignal(str)
+    _watch_sig = pyqtSignal(str)
+    _sh_sig = pyqtSignal(str)
+    _status_sig = pyqtSignal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedWidth(_DASH_W)
@@ -668,6 +674,11 @@ class DashboardPanel(QFrame):
         self.lbl_watch = self._section("📈", "Watchlist", "Watchlist empty.")
         self.lbl_sh = self._section("🏠", "Smart Home", "Not connected.")
         self.lbl_weather = self._section("🌤", "Weather", "Loading…")
+        self._weather_sig.connect(self.lbl_weather.setText)
+        self._tasks_sig.connect(self.lbl_tasks.setText)
+        self._watch_sig.connect(self.lbl_watch.setText)
+        self._sh_sig.connect(self.lbl_sh.setText)
+        self._status_sig.connect(self.lbl_status.setText)
         self._lay.addStretch()
 
         self._task_tmr = QTimer(self)
@@ -675,7 +686,7 @@ class DashboardPanel(QFrame):
         self._task_tmr.start(30_000)
         self._watch_tmr = QTimer(self)
         self._watch_tmr.timeout.connect(self.refresh_watchlist)
-        self._watch_tmr.start(300_000)
+        self._watch_tmr.start(60_000)
         self._weather_tmr = QTimer(self)
         self._weather_tmr.timeout.connect(self.refresh_weather)
         self._weather_tmr.start(30 * 60 * 1000)
@@ -684,6 +695,9 @@ class DashboardPanel(QFrame):
         self._sh_tmr.start(15_000)
 
         self.refresh_all()
+        QTimer.singleShot(2000, self.refresh_weather)
+        QTimer.singleShot(2500, self.refresh_watchlist)
+        QTimer.singleShot(1500, self.refresh_tasks)
 
     def _section(self, icon: str, title: str, body: str) -> QLabel:
         card = QFrame()
@@ -747,12 +761,14 @@ class DashboardPanel(QFrame):
         threading.Thread(target=self._refresh_sh_async, daemon=True).start()
 
     def refresh_status(self):
-        try:
-            from llm_client import get_active_model
-            m = get_active_model()
-            self.lbl_status.setText(f"● {m['model']} ({m['provider']})")
-        except Exception:
-            self.lbl_status.setText("● offline — check Ollama")
+        def _probe():
+            try:
+                from llm_client import get_active_model
+                m = get_active_model()
+                self._status_sig.emit(f"● {m['model']} ({m['provider']})")
+            except Exception:
+                self._status_sig.emit("● offline — check Ollama")
+        threading.Thread(target=_probe, daemon=True).start()
 
     def refresh_tasks(self):
         threading.Thread(target=self._refresh_tasks_async, daemon=True).start()
@@ -761,14 +777,22 @@ class DashboardPanel(QFrame):
         try:
             from db.database import get_active_tasks
             tasks = get_active_tasks()
-            if not tasks:
+            seen: set[str] = set()
+            unique = []
+            for t in tasks:
+                title = (t.get("title") or "").strip()
+                if not title or title.lower() in seen:
+                    continue
+                seen.add(title.lower())
+                unique.append(t)
+            if not unique:
                 txt = "No active tasks."
             else:
-                lines = [f"• {t['title']} ({t.get('status', 'active')})" for t in tasks[:6]]
+                lines = [f"• {t['title']}" for t in unique[:6]]
                 txt = "\n".join(lines)
-            QTimer.singleShot(0, lambda: self.lbl_tasks.setText(txt))
-        except Exception:
-            pass
+        except Exception as e:
+            txt = f"Tasks error: {e}"
+        self._tasks_sig.emit(txt)
 
     def refresh_watchlist(self):
         threading.Thread(target=self._refresh_watch_async, daemon=True).start()
@@ -778,28 +802,26 @@ class DashboardPanel(QFrame):
             from db.database import get_watchlist
             watch = get_watchlist()
             if not watch:
-                QTimer.singleShot(0, lambda: self.lbl_watch.setText("Watchlist empty."))
+                self._watch_sig.emit("Watchlist empty.\nType: add ITC to watchlist")
                 return
             lines = []
-            try:
-                import yfinance as yf
-                for w in watch[:5]:
-                    sym = w["symbol"]
-                    try:
-                        t = yf.Ticker(sym)
-                        info = t.fast_info
-                        price = getattr(info, "last_price", None) or getattr(info, "lastPrice", None)
-                        if price:
-                            lines.append(f"{sym}\n  ₹{price:,.2f}" if "NS" in sym or "BO" in sym else f"{sym}\n  ${price:,.2f}")
-                        else:
-                            lines.append(f"• {sym}")
-                    except Exception:
-                        lines.append(f"• {sym}")
-            except ImportError:
-                lines = [f"• {w['symbol']}" for w in watch[:5]]
-            QTimer.singleShot(0, lambda: self.lbl_watch.setText("\n".join(lines) or "Watchlist empty."))
-        except Exception:
-            pass
+            for item in watch[:8]:
+                sym = item["symbol"]
+                try:
+                    from actions.market_tracker import _get_price
+                    d = _get_price(sym)
+                    if d.get("ok"):
+                        arrow = "▲" if d["change"] >= 0 else "▼"
+                        lines.append(
+                            f"{sym}  ₹{d['price']} {arrow}{abs(d['change'])}({d['change_pct']}%)"
+                        )
+                    else:
+                        lines.append(f"{sym}  —")
+                except Exception:
+                    lines.append(sym)
+            self._watch_sig.emit("\n".join(lines))
+        except Exception as e:
+            self._watch_sig.emit(f"Watchlist error: {e}")
 
     def refresh_weather(self):
         threading.Thread(target=self._refresh_weather_async, daemon=True).start()
@@ -807,12 +829,12 @@ class DashboardPanel(QFrame):
     def _refresh_weather_async(self):
         try:
             from llm_client import get_settings
-            city = get_settings().get("weather_city") or "Chennai"
+            city = (get_settings().get("weather_city") or "Chennai").strip()
             from services.weather_service import format_weather_line
             line = format_weather_line(city)
-            QTimer.singleShot(0, lambda: self.lbl_weather.setText(line))
-        except Exception:
-            QTimer.singleShot(0, lambda: self.lbl_weather.setText("Weather unavailable."))
+            self._weather_sig.emit(line)
+        except Exception as e:
+            self._weather_sig.emit(f"Weather error: {e}")
 
     def refresh_smart_home(self):
         threading.Thread(target=self._refresh_sh_async, daemon=True).start()
@@ -823,16 +845,16 @@ class DashboardPanel(QFrame):
             mgr = SmartHomeManager()
             ha = mgr.home_assistant
             if not ha.get("url") or not ha.get("token"):
-                QTimer.singleShot(0, lambda: self.lbl_sh.setText("Not connected.\nConfigure in ⚙ MODELS."))
+                self._sh_sig.emit("Not connected.\nConfigure in ⚙ SETTINGS.")
                 return
             devs = mgr.list_devices()
             if not devs:
-                QTimer.singleShot(0, lambda: self.lbl_sh.setText("Connected — no devices."))
+                self._sh_sig.emit("Connected — no devices.")
                 return
             lines = [f"• {d.get('friendly_name', d.get('entity_id', '?'))}" for d in devs[:4]]
-            QTimer.singleShot(0, lambda: self.lbl_sh.setText("\n".join(lines)))
+            self._sh_sig.emit("\n".join(lines))
         except Exception:
-            QTimer.singleShot(0, lambda: self.lbl_sh.setText("Smart home unavailable."))
+            self._sh_sig.emit("Smart home unavailable.")
 
 
 _FILE_ICONS = {
@@ -1223,6 +1245,12 @@ class MainWindow(QMainWindow):
     def __init__(self, face_path: str):
         super().__init__()
         self.setWindowTitle("Mark-XXXIX")
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
         self.setMinimumSize(_MIN_W, _MIN_H)
         self.resize(_DEFAULT_W, _DEFAULT_H)
 
@@ -1275,6 +1303,11 @@ class MainWindow(QMainWindow):
         self._right_panel = self._build_right_panel()
         body.addWidget(self._right_panel, stretch=0)
 
+        from ui.activity_panel import ActivitySidePanel, bind_panel
+        self._activity = ActivitySidePanel()
+        body.addWidget(self._activity, stretch=0)
+        bind_panel(self._activity)
+
         root.addLayout(body, stretch=1)
 
         self._clock_tmr = QTimer(self)
@@ -1291,6 +1324,8 @@ class MainWindow(QMainWindow):
         self._state_sig.connect(self._apply_state)
         self._show_sig.connect(self.show_window)
         self._hide_sig.connect(self.hide_to_tray)
+
+        QTimer.singleShot(800, self._refresh_side)
 
         self._overlay: SetupOverlay | None = None
         self._ready = self._check_config()
@@ -1497,7 +1532,7 @@ class MainWindow(QMainWindow):
 
     def _build_right_panel(self) -> QWidget:
         w = QWidget()
-        w.setFixedWidth(_RIGHT_W)
+        w.setMinimumWidth(_RIGHT_W)
         w.setStyleSheet(f"background: {C.DARK}; border-left: 1px solid {C.BORDER};")
         lay = QVBoxLayout(w)
         lay.setContentsMargins(8, 8, 8, 8)
@@ -1533,6 +1568,16 @@ class MainWindow(QMainWindow):
         lay.addWidget(sep2)
 
         lay.addWidget(_sec("COMMAND INPUT"))
+        from ui.toolbar_buttons import build_action_bar, AddTaskDialog
+        self._add_task_dialog_cls = AddTaskDialog
+        self._jarvis_ref = None
+        self._action_bar = build_action_bar(
+            on_stop=self._on_stop_clicked,
+            on_mini_screen=self._on_mini_screen_clicked,
+            on_add_task=self._on_add_task_clicked,
+            on_mute_toggle=self._on_mute_toggle_clicked,
+        )
+        lay.addWidget(self._action_bar)
         lay.addLayout(self._build_input_row())
 
         self._mute_btn = QPushButton("🎙  MICROPHONE ACTIVE")
@@ -1635,6 +1680,33 @@ class MainWindow(QMainWindow):
             self._dash.show()
             self._dash_toggle.setText("<")
 
+    def _on_stop_clicked(self):
+        ref = self._jarvis_ref
+        if ref and hasattr(ref, "_do_stop"):
+            ref._do_stop()
+
+    def _on_mini_screen_clicked(self):
+        try:
+            from ui.screen_overlay import show_screen_preview
+            show_screen_preview()
+            self._log.append_log("SYS: Live screen preview opened.")
+        except Exception as e:
+            self._log.append_log(f"SYS: Screen preview error: {e}")
+
+    def _on_add_task_clicked(self):
+        dlg = self._add_task_dialog_cls(self)
+        def _on_task(title, desc, cat):
+            from db.database import save_task
+            save_task(title, desc, cat)
+            self._log.append_log(f"SYS: Task added — {title}")
+            self._refresh_side()
+        dlg.task_added.connect(_on_task)
+        dlg.exec()
+
+    def _on_mute_toggle_clicked(self, muted: bool):
+        if muted != self._muted:
+            self._toggle_mute()
+
     def _toggle_mute(self):
         self._muted = not self._muted
         self.hud.muted = self._muted
@@ -1652,6 +1724,18 @@ class MainWindow(QMainWindow):
         self.show()
         self.raise_()
         self.activateWindow()
+        try:
+            import ctypes
+            hwnd = int(self.winId())
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, 20, ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int)
+            )
+        except Exception:
+            pass
+        if hasattr(self, "_dash"):
+            self._dash.show()
+            self._dash_toggle.setText("<")
+            QTimer.singleShot(100, self._refresh_side)
         self.window_shown_sig.emit()
 
     def hide_to_tray(self):
@@ -1720,6 +1804,11 @@ class MainWindow(QMainWindow):
         self.hud.speaking = (state == "SPEAKING")
         if hasattr(self, "_dash"):
             self._dash.set_mode(state)
+        try:
+            from ui.mini_hud import get_mini_hud
+            get_mini_hud().set_state(state)
+        except Exception:
+            pass
 
     # ── config helpers ────────────────────────────────────────────────
     def _check_config(self) -> bool:
@@ -1834,6 +1923,14 @@ class JarvisUI:
     def on_close(self, cb):
         self._win.on_close = cb
 
+    @property
+    def _jarvis_ref(self):
+        return getattr(self._win, "_jarvis_ref", None)
+
+    @_jarvis_ref.setter
+    def _jarvis_ref(self, ref):
+        self._win._jarvis_ref = ref
+
     def show(self):
         self._win._show_sig.emit()
 
@@ -1869,3 +1966,11 @@ class JarvisUI:
     def stop_speaking(self):
         if not self.muted:
             self.set_state("LISTENING")
+
+    def show_tool_activity(self, tool_name: str, detail: str = ""):
+        if hasattr(self._win, "_activity"):
+            self._win._activity.show_activity(tool_name, detail)
+
+    def hide_tool_activity(self):
+        if hasattr(self._win, "_activity"):
+            self._win._activity.hide_activity()

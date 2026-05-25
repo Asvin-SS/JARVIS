@@ -1,9 +1,9 @@
 # Mark-XXXIX User Manual
 
-**Version:** Mark-3.9  
+**Version:** Mark-XXXIX (3.9)  
 **Author:** SS
 
-This manual explains how to install, run, and use Mark-XXXIX day to day. For developers, see `README.md` and `TASK_CHECKLIST.md`.
+This manual explains how to install, run, and use Mark-XXXIX day to day. For a quick overview see `README.md`. For verification steps see `TASK_CHECKLIST.md`.
 
 ---
 
@@ -14,6 +14,7 @@ This manual explains how to install, run, and use Mark-XXXIX day to day. For dev
 1. Install [Python 3.10+](https://www.python.org/downloads/) (check **Add to PATH** on Windows).
 2. Install [Ollama](https://ollama.com/download).
 3. Install [Git](https://git-scm.com/) if cloning the repo.
+4. Microphone + speakers (optional if you only type commands).
 
 ### 1.2 Project setup
 
@@ -25,6 +26,12 @@ pip install -r requirements.txt
 ollama pull mistral
 ```
 
+Optional — local coding agent (uses Ollama or Aider CLI):
+
+```powershell
+pip install aider-chat
+```
+
 ### 1.3 First run
 
 ```powershell
@@ -32,137 +39,264 @@ ollama serve
 python main.py
 ```
 
-- A window opens with a short **OS selection** overlay (first time only).
-- After setup, Jarvis greets you (**Good morning/afternoon/evening, SS**), then the window moves to the **system tray**.
+- First launch: complete the **OS setup** overlay (Windows / macOS / Linux).
+- The main window opens with the **dashboard**, **HUD**, and **activity log**.
+- Jarvis speaks a short greeting (*Good morning/afternoon/evening, SS*).
+- By default the window **stays visible** and the microphone is active.
 
 ---
 
-## 2. Understanding the interface
+## 2. Project folder structure
 
-### 2.1 Layout
+```
+Mark-XXXIX-main/
+├── main.py                 # Entry point — voice, TTS, LLM, tool routing
+├── jarvis_ui.py            # PyQt6 main window, dashboard, tray, HUD
+├── ui_settings.py          # Settings dialog (Models, Voice, Smart Home, Startup)
+├── llm_client.py           # Ollama / OpenAI / Anthropic, tools, model catalog
+├── smart_home.py           # Home Assistant integration
+│
+├── actions/                # One file per tool (Jarvis capabilities)
+│   ├── browser_control.py
+│   ├── coding_bridge.py    # Local code edit (Ollama + optional Aider)
+│   ├── code_helper.py
+│   ├── dev_agent.py        # Multi-file project builder
+│   ├── market_tracker.py
+│   ├── screen_processor.py
+│   ├── weather_report.py
+│   └── …
+│
+├── agent/                  # Unified agent layer
+│   ├── orchestrator.py     # Intent hints in system prompt
+│   ├── task_queue.py       # Background multi-step tasks
+│   ├── planner.py
+│   └── executor.py
+│
+├── core/                   # Config, identity, hardware, vision
+│   ├── config.py           # Paths, timeouts, model roles
+│   ├── identity.txt        # Jarvis persona (SS / Mark-XXXIX)
+│   ├── prompt.txt          # Execution rules
+│   ├── language.py         # Tanglish / Tamil / STT language
+│   ├── hardware_profile.py # RAM/CPU scan → best Ollama model
+│   ├── model_router.py     # Route coding / vision / reasoning models
+│   └── vision_backend.py   # Screen vision (llava / fallback)
+│
+├── services/
+│   └── weather_service.py  # Cached weather (wttr.in + open-meteo fallback)
+│
+├── db/
+│   ├── database.py         # SQLite API
+│   └── jarvis.db           # Auto-created (gitignored)
+│
+├── memory/                 # Long-term memory + session helpers
+├── diagnostics/            # Startup health checks
+├── ui/
+│   ├── activity_panel.py   # Right-side “agent task” strip during tools
+│   └── screen_overlay.py   # Mini screen preview during vision
+│
+├── tests/
+│   └── system_validation.py
+│
+├── config/                 # settings.json, api_keys.json (gitignored)
+├── docs/LOCAL_MODELS.md
+├── logs/                   # jarvis.log (gitignored)
+├── knowledge/optimizely/   # Enterprise commerce notes
+├── capability_registry/
+├── self_upgrade/
+│
+├── README.md
+├── MANUAL.md               # This file
+├── TASK_CHECKLIST.md
+└── requirements.txt
+```
+
+**Runtime data:** `db/jarvis.db`, `config/settings.json`, `config/api_keys.json`, `logs/`.
+
+---
+
+## 3. Understanding the interface
+
+### 3.1 Layout
+
+```
+┌──────────┬─────────────┬──────────────┬────────────┬─────────────────┐
+│ Metrics  │  HUD face   │  Dashboard   │ Agent task │  Activity log   │
+│ CPU/RAM  │  + status   │  Tasks       │  (tools)   │  + file upload  │
+│          │             │  Watchlist   │            │  + command box  │
+│          │             │  Smart home  │            │                 │
+│          │             │  Weather     │            │                 │
+└──────────┴─────────────┴──────────────┴────────────┴─────────────────┘
+```
 
 | Area | Location | Purpose |
 |------|----------|---------|
-| **System monitor** | Left strip | CPU, RAM, network, GPU, temperature |
-| **HUD** | Center | Animated face / status ring |
-| **Dashboard** | Between HUD and chat | Tasks, watchlist, smart home, weather |
+| **System monitor** | Left strip | CPU, RAM, network, GPU, temperature, uptime |
+| **HUD** | Center | Animated face / listening ring |
+| **Dashboard** | Left of chat | Tasks, watchlist, smart home, weather |
+| **Agent task** | Thin right strip | Live status while a tool runs (browser, code, etc.) |
 | **Activity log** | Right | Conversation history |
 | **Command input** | Bottom right | Type commands |
 | **File upload** | Right panel | Drag & drop files for analysis |
 
-### 2.2 Dashboard (important)
+### 3.2 Dashboard
 
-If you do not see tasks or watchlist:
+If tasks or watchlist look empty:
 
-1. **Widen the window** — minimum width ~1100px recommended.
-2. Look for the **`>`** button between the HUD and the chat panel — click it to **expand** the dashboard.
-3. Sections refresh automatically:
-   - Tasks: every 30 seconds  
-   - Watchlist: every 60 seconds  
-   - Weather: every 30 minutes  
-   - Smart home: every 15 seconds  
+1. **Widen the window** — minimum ~1100px recommended.
+2. Click **`>`** between HUD and chat if the dashboard is collapsed.
+3. Say or type **`refresh dashboard`**.
 
-### 2.3 Header controls
+Auto-refresh intervals: tasks 30s · watchlist 5min · weather 30min · smart home 15s.
 
-- **⚙ MODELS** — Change LLM, API keys, warm up model.
-- **Clock** — Local time and date.
-- **F4** — Toggle microphone mute (TTS can still run unless you use mute for voice-only; see §5).
-- **F11** — Fullscreen.
+### 3.3 Header and shortcuts
 
-### 2.4 System tray
+| Control | Action |
+|---------|--------|
+| **⚙ SETTINGS** | Models, voice, smart home, startup |
+| **F4** | Toggle **microphone mute** (TTS still works) |
+| **F11** | Fullscreen |
+| **Enter** | Send typed command |
 
-- **Show** — Open the main window (starts voice capture).
-- **Hide** — Minimize to tray (wake word active).
-- **Quit** — Exit the application.
+### 3.4 System tray
 
----
-
-## 3. Voice usage
-
-### 3.1 Tray + wake word flow
-
-1. App starts in tray after greeting.
-2. Say **"Jarvis"** or **"Hey Jarvis"** (clearly, near the mic).
-3. Window opens; you hear a chime and *"I'm listening, sir."*
-4. Speak your command in one sentence.
-5. Jarvis thinks (orange ring), then speaks and logs the reply.
-
-### 3.2 While the window is open
-
-- The microphone is active when the window is **visible**.
-- **Mute** with the mic button or **F4** — stops listening; use for privacy.
-- **Interrupt**: speak or type a new command while Jarvis is answering — previous reply shows `[cancelled]`.
-
-### 3.3 Typed commands
-
-- Same brain as voice — type in **COMMAND INPUT** and press Enter or **▸**.
-- Responses are **always shown** in the log and **spoken** unless TTS is blocked by an error.
+| Menu | Action |
+|------|--------|
+| **Show** | Open window + start voice capture |
+| **Hide** | Minimize to tray + wake word listener |
+| **Quit** | Exit (session summary saved if Ollama is up) |
 
 ---
 
-## 4. Settings and models
+## 4. Voice and chat behaviour
 
-### 4.1 Open settings
+### 4.1 Normal flow
 
-Click **⚙ MODELS** in the header.
+1. Window visible → microphone listens (unless muted).
+2. Speak or type a command.
+3. Orange ring = **processing** (LLM / tools).
+4. Jarvis **writes** the full reply in the log and **speaks** a short version (TTS enabled in Settings).
 
-### 4.2 Ollama models
+### 4.2 Stop — the only interrupt
 
-- Only **installed** models appear (from `ollama list`).
-- Select a radio button → saved immediately to `config/settings.json`.
-- **WARM UP SELECTED MODEL** — loads weights into RAM (recommended after switching).
+Jarvis **does not** cancel on background noise or random speech.
 
-### 4.3 Cloud API keys
+To cancel the current reply or tool:
 
-- **OpenAI** / **Anthropic** — paste keys, **Test**, then **SAVE & APPLY**.
-- When a cloud provider is selected, Ollama is not used for that session's provider choice.
+- Say or type: **`stop`**, **`Jarvis stop`**, **`okay Jarvis stop`**, **`cancel`**
 
-### 4.4 Timeouts
+While Jarvis is busy, new voice input is **ignored** until you say stop or the task finishes.
 
-If local models are slow:
+### 4.3 Fast commands (no Ollama required)
 
-```powershell
-$env:OLLAMA_TIMEOUT_SEC = "900"
-python main.py
+These work even when `ollama serve` is offline:
+
+| Say or type | Result |
+|-------------|--------|
+| `list tasks` / `what are my pending tasks` | Reads tasks from SQLite |
+| `pull weather` / `today's weather` | Cached weather line |
+| `show watchlist` / `groww` | Watchlist symbols |
+| `add task: …` | Saves task + refreshes dashboard |
+| `add RELIANCE to watchlist` | Adds symbol |
+| `refresh dashboard` | Refreshes all dashboard cards |
+| Tamil language question | Short spoken answer (Tamil/Tanglish supported) |
+| `open chrome and youtube` | Opens browser (fast path) |
+
+### 4.4 Tamil and Tanglish
+
+- **Settings → Voice → Reply language:** `tanglish` (default), `english`, or `tamil`.
+- **Speech-to-text:** `auto`, `en`, or `ta` (Whisper **base** multilingual model).
+- Example: *"Can you understand Tamil?"* → fast local answer without LLM.
+
+### 4.5 Wake word (tray mode)
+
+When the window is **hidden**:
+
+1. Say **"Jarvis"** or **"Hey Jarvis"**.
+2. Window opens, chime, *"I'm listening, SS."*
+3. Speak your command.
+
+Requires `SpeechRecognition` + `pyaudio` (see §15).
+
+### 4.6 Idle mode (permission required)
+
+After **90 seconds** with no interaction, Jarvis asks:
+
+> *"SS, should I go idle and minimize? Say yes or no."*
+
+- **Yes** → minimizes to tray (wake word stays active).
+- **No** → stays on screen; timer resets.
+
+Jarvis will **not** disappear without asking.
+
+---
+
+## 5. Settings
+
+Open **⚙ SETTINGS** in the header.
+
+### 5.1 Models tab
+
+- Pick an **installed** Ollama model (from `ollama list`).
+- **Warm up selected model** — loads weights into RAM.
+- **Install open-source models** — pull from catalog.
+- **API keys** — OpenAI / Anthropic (optional cloud fallback).
+
+### 5.2 Voice tab
+
+| Option | Purpose |
+|--------|---------|
+| Enable speech (TTS) | Speak replies aloud |
+| Require "Jarvis" prefix | Ignore voice that doesn't start with Jarvis |
+| Reply language | tanglish / english / tamil |
+| Speech-to-text | auto / en / ta |
+| Wake word sensitivity | Low / Medium / High |
+
+Mic mute (F4) stops **listening only** — chat log and TTS are separate.
+
+### 5.3 Smart Home tab
+
+Home Assistant URL + long-lived token. **Test connection** then **Save**.
+
+### 5.4 Startup tab
+
+| Option | Default | Purpose |
+|--------|---------|---------|
+| Start minimised to tray | Off | Window visible on launch |
+| Run greeting sequence | On | Spoken time/date greeting |
+| Show active tasks on startup | On | Mention task count in greeting |
+| Default weather city | Chennai | Dashboard + weather tools |
+
+### 5.5 Hardware-adaptive model
+
+On startup, Mark-XXXIX scans RAM/CPU and picks the best local model (`core/hardware_profile.py`).
+
+Controlled in `config/settings.json`:
+
+```json
+"auto_hardware_model": true,
+"auto_pull_model": true
 ```
 
----
-
-## 5. Mute and TTS
-
-| Control | Effect |
-|---------|--------|
-| **🔇 MICROPHONE MUTED** | Stops voice *input*; preference saved in DB |
-| Assistant replies | Still queued for TTS unless engine fails |
-| Chat log | Always updated |
-
-For silent operation, use typed commands only and lower system volume, or extend mute behavior in settings.
+If Ollama is offline, hardware scan is saved but model switch waits until `ollama serve` runs.
 
 ---
 
 ## 6. Tasks and memory
 
-### 6.1 Creating tasks
+### Creating tasks
 
-Say or type:
+- Voice: *"Remind me to finish the report tomorrow."*
+- Fast: **`add task: call client at 3pm`**
+- LLM tool: `save_task` when Jarvis detects a goal
 
-- *"Remind me to finish the report tomorrow."*
-- *"Track my habit: drink water daily."*
-- *"I need to call the client at 3."*
+Tasks appear in **📋 Active Tasks** and in `db/jarvis.db`. Test rows (`category: test`) are hidden from the dashboard.
 
-Tasks appear in the dashboard **📋 Active Tasks** and in `db/jarvis.db`.
-
-### 6.2 Startup recap
-
-After the greeting, Jarvis may ask: *"Want me to recap your pending tasks?"*  
-Answer **yes** or **no**.
-
-### 6.3 Catch-up
+### Catch-up
 
 - *"What was I doing?"*
 - *"Catch me up."*
 
-Uses the last session summary and recent conversation rows.
+Uses last session summary + recent conversation rows.
 
 ---
 
@@ -171,91 +305,92 @@ Uses the last session summary and recent conversation rows.
 | Command | Result |
 |---------|--------|
 | Add RELIANCE.NS to my watchlist | Saves symbol |
-| Show my watchlist | Lists symbols + prices |
-| What is TCS.NS trading at? | Price quote |
-| Open Groww | Opens Groww in browser |
+| Show my watchlist | Dashboard + spoken list |
+| Open Groww | Browser → Groww |
+| What is TCS.NS trading at? | Price via `market_tracker` |
 
-Indian symbols often need `.NS` suffix (NSE).
+Indian NSE symbols often need the **`.NS`** suffix.
 
 ---
 
 ## 8. Smart home
 
-1. Configure Home Assistant URL and token (see `README.md`).
-2. Dashboard **🏠** shows device names when connected.
-3. Examples:
-   - *"Turn on the living room light."*
-   - *"Turn off bedroom switch."*
-
-Jarvis parses intent and calls Home Assistant services.
+1. Configure Home Assistant in **Settings → Smart Home**.
+2. Dashboard **🏠** shows devices when connected.
+3. Examples: *"Turn on the living room light."*
 
 ---
 
-## 9. Screen assistance
+## 9. Screen and vision
 
-| Mode | Trigger | Behavior |
-|------|---------|----------|
-| **On-demand** | "View my screen" | One screenshot → vision analysis |
-| **Continuous** | "Keep watching my screen" | Every 30s if screen changes |
-| **Stop** | "Stop watching" | Ends monitoring |
+| Mode | Trigger | UI |
+|------|---------|-----|
+| On-demand | "View my screen" | Mini **screen overlay** (top-left) |
+| Continuous | "Keep watching my screen" | Overlay updates every ~30s |
+| Stop | "Stop watching" | Overlay closes |
 
-Vision may temporarily use `llava` if the active text model has no vision support.
-
----
-
-## 10. Files
-
-1. Drag a file onto the **FILE UPLOAD** zone.
-2. Jarvis acknowledges the file in chat.
-3. Ask: *"Summarize this PDF"* or *"Extract tables from this spreadsheet."*
-
-Supported types include PDF, Office docs, images, code, archives (see `file_processor.py`).
+Uses local **llava** when installed; optional cloud vision fallback in settings.
 
 ---
 
-## 11. Building new tools
+## 10. Coding and debugging
 
-Ask:
+| Tool | Use |
+|------|-----|
+| `code_helper` | Write, explain, run snippets |
+| `coding_bridge` | Edit/fix a file locally (Ollama; **Aider** if installed) |
+| `dev_agent` | Build multi-file projects from description |
 
-> *"Build me a tool that tracks my daily water intake."*
+Install Aider for stronger repo-aware edits:
 
-Jarvis uses `dev_agent.py` to:
+```powershell
+pip install aider-chat
+```
 
-1. Ask one clarifying question.
-2. Write `actions/your_tool.py`.
-3. Register it live.
-4. Confirm in voice and chat.
+During tool runs, watch the **Agent task** strip on the right for live status.
 
 ---
 
-## 12. Shutting down
+## 11. Files
+
+1. Drag a file onto **FILE UPLOAD**.
+2. Ask: *"Summarize this PDF"* or *"Extract tables from this spreadsheet."*
+
+Supported: PDF, Office, images, code, archives (see `actions/file_processor.py`).
+
+---
+
+## 12. Building new tools
+
+Ask: *"Build me a tool that tracks my daily water intake."*
+
+Jarvis uses `dev_agent.py` to write `actions/your_tool.py`, register it, and confirm in chat + voice.
+
+---
+
+## 13. Shutting down
 
 - Tray → **Quit**, or
-- *"Goodbye Jarvis"* / shutdown command if implemented in your build.
+- *"Goodbye Jarvis"* / shutdown command.
 
-On close, a **session summary** is written to the database.
+Session summary is saved to the database when Ollama is available.
 
 ---
 
-## 13. Data and privacy
+## 14. Data and privacy
 
 | Data | Location |
 |------|----------|
 | Conversations, tasks, sessions | `db/jarvis.db` |
 | API keys | `config/api_keys.json` (gitignored) |
 | Settings | `config/settings.json` |
+| Logs | `logs/jarvis.log` |
 
-Back up `db/` and `config/` if you reinstall Windows.
+Back up `db/` and `config/` before reinstalling Windows.
 
 ---
 
-## 14. Common problems
-
-### Dashboard empty
-
-- No tasks in DB yet — create one via voice.
-- Watchlist empty — add a symbol first.
-- Weather fails — check internet / `weather_report` dependencies.
+## 15. Common problems
 
 ### Ollama connection error
 
@@ -264,25 +399,68 @@ ollama serve
 curl http://localhost:11434/api/tags
 ```
 
-### App closes immediately
+Fast commands (tasks, weather, Tamil FAQ) still work without Ollama.
 
-Run from terminal to see errors:
+### No speech (TTS silent)
+
+1. **Settings → Voice** → enable **Enable speech (TTS on every reply)**.
+2. Check Windows volume / default output device.
+3. Terminal should not show repeated `(no TTS)` lines.
+
+### Constant “Stopped” or no response
+
+- You may have said **stop** — send a fresh command.
+- Wait until the orange **processing** state clears before sending another.
+
+### Dashboard empty
+
+- Create a task: `add task: test item`
+- `refresh dashboard`
+- Widen window; expand with **`>`**
+
+### Weather stuck on “Loading…”
+
+- Check internet; service tries wttr.in then open-meteo.
+- Set city in **Settings → Startup → Default weather city**.
+
+### Mic / wake word errors (Windows)
 
 ```powershell
+pip install pyaudio faster-whisper sounddevice SpeechRecognition
+```
+
+### PyAudio pip failure
+
+Install a prebuilt wheel matching your Python version.
+
+### Hugging Face Whisper warning
+
+Harmless on Windows. Optional: set `HF_HUB_DISABLE_SYMLINKS_WARNING=1` or enable Windows Developer Mode for symlinks.
+
+### Slow local model
+
+```powershell
+$env:OLLAMA_TIMEOUT_SEC = "900"
 python main.py
 ```
 
-### PyAudio / mic errors (Windows)
-
-```powershell
-pip install pyaudio
-```
-
-If pip fails, install a prebuilt wheel for your Python version.
+Warm up model in **Settings → Models**.
 
 ---
 
-## 15. Keyboard shortcuts
+## 16. Developer quick reference
+
+| Task | Command / file |
+|------|----------------|
+| Run tests | `python -m tests.system_validation` |
+| Health check | `diagnostics/system_diagnostics.py` |
+| Change persona | `core/identity.txt` |
+| Change timeouts | `core/config.py` or env `OLLAMA_TIMEOUT_SEC` |
+| Add a tool | New file in `actions/` + register in `main.py` `TOOL_DECLARATIONS` |
+
+---
+
+## 17. Keyboard shortcuts
 
 | Key | Action |
 |-----|--------|
@@ -292,12 +470,4 @@ If pip fails, install a prebuilt wheel for your Python version.
 
 ---
 
-## 16. Getting help
-
-1. Read `README.md` troubleshooting table.
-2. Walk through `TASK_CHECKLIST.md` and note which items fail.
-3. Check the terminal for `[JARVIS]` and `[DB]` log lines.
-
----
-
-*Mark-3.9 — A product of SS*
+*Mark-XXXIX — A product of SS*

@@ -828,6 +828,22 @@ def browser_control(
         _log(player, result)
         return result
 
+    if action in ("open", "goto", "visit"):
+        url = params.get("url") or params.get("query") or ""
+        if not url:
+            result = "No URL provided."
+        else:
+            if not str(url).startswith("http"):
+                url = "https://" + str(url).strip()
+            import webbrowser
+            try:
+                webbrowser.open(url)
+                result = f"Opened {url}"
+            except Exception as e:
+                result = f"Browser open failed: {e}"
+        _log(player, result)
+        return result
+
     try:
         sess = _registry.get(browser)
     except Exception as e:

@@ -247,7 +247,9 @@ def generate_session_summary(history: list[dict]) -> str:
         return "No activity recorded."
     
     try:
-        from llm_client import unified_chat
+        from llm_client import unified_chat, is_ollama_running
+        if not is_ollama_running():
+            return "Session ended."
         context = "\n".join([f"{h['role']}: {h['content'][:100]}" for h in history[-10:]])
         prompt = f"Summarize this session in one brief sentence for Jarvis to remember:\n\n{context}"
         summary = unified_chat("You are JARVIS.", prompt)

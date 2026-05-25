@@ -1,10 +1,15 @@
 {
-  "version": 1,
+  "version": 2,
   "capabilities": [
     {"id": "voice_assistant", "status": "active", "module": "main.py"},
     {"id": "ollama_llm", "status": "active", "module": "llm_client.py"},
     {"id": "sqlite_memory", "status": "active", "module": "db/database.py"},
-    {"id": "dashboard", "status": "active", "module": "ui.py"},
+    {"id": "dashboard", "status": "active", "module": "jarvis_ui.py"},
+    {"id": "settings_ui", "status": "active", "module": "ui_settings.py"},
+    {"id": "activity_panel", "status": "active", "module": "ui/activity_panel.py"},
+    {"id": "hardware_profile", "status": "active", "module": "core/hardware_profile.py"},
+    {"id": "coding_bridge", "status": "active", "module": "actions/coding_bridge.py"},
+    {"id": "weather_cache", "status": "active", "module": "services/weather_service.py"},
     {"id": "screen_vision", "status": "partial", "module": "actions/screen_processor.py"},
     {"id": "self_build_tools", "status": "partial", "module": "actions/dev_agent.py"},
     {"id": "multi_agent_planner", "status": "partial", "module": "agent/orchestrator.py"},
